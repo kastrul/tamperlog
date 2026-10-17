@@ -63,8 +63,10 @@ func New(url string, opts ...Option) *Client {
 // and returns the DER TimeStampToken (the CMS ContentInfo, not the whole
 // response). It checks the HTTP status and content type, that the TSA
 // granted the request, and that the token's message imprint and nonce match
-// the request; a refused request is reported as a *[StatusError]. The token
-// is parsed but not verified: run [Verifier.Verify] or use [Provider].
+// the request and, when [WithPolicy] is set, that the token was issued under
+// that policy (RFC 3161 section 2.4.2); a refused request is reported as a
+// *[StatusError]. The token is parsed but not verified: run [Verifier.Verify]
+// or use [Provider].
 func (c *Client) Anchor(ctx context.Context, digest []byte) ([]byte, error) {
 	reqDER, nonce, err := buildRequest(digest, c.policy, c.certReq)
 	if err != nil {
@@ -120,6 +122,9 @@ func (c *Client) Anchor(ctx context.Context, digest []byte) ([]byte, error) {
 	}
 	if tok.Nonce == nil || tok.Nonce.Cmp(nonce) != 0 {
 		return nil, errors.New("rfc3161: response token does not echo the request nonce")
+	}
+	if len(c.policy) > 0 && !tok.Policy.Equal(c.policy) {
+		return nil, fmt.Errorf("rfc3161: response token policy %s, requested %s", tok.Policy, c.policy)
 	}
 	return token, nil
 }

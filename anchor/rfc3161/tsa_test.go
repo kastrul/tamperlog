@@ -160,7 +160,10 @@ type tsa struct {
 
 	// knobs
 	genTimeRaw      string                      // literal GeneralizedTime instead of genTime
+	accuracyRaw     func(*cryptobyte.Builder)   // build the Accuracy body by hand instead of from accuracy
+	sdVersion       int64                       // SignedData version (0 = 3)
 	includeRoot     bool                        // include the root in the certificates set
+	extraCerts      int                         // append the root this many more times
 	omitCerts       bool                        // leave the certificates set out
 	includeTSAName  bool                        // set the tsa field to the signer's subject
 	criticalExt     bool                        // add an unknown critical TSTInfo extension
@@ -171,8 +174,16 @@ type tsa struct {
 	essV1           bool                        // use signing-certificate (SHA-1) instead of v2
 	essV2Hash       asn1.ObjectIdentifier       // explicit hash algorithm in ESSCertIDv2
 	essMismatch     bool                        // hash the root instead of the signer
+	essRootFirst    bool                        // put an ESSCertID for the root before the signer's
+	essRootSecond   bool                        // put an ESSCertID for the root after the signer's
+	essNoDirName    bool                        // issuerSerial names a dNSName only, no directoryName
+	essPolicies     bool                        // add a policies field to the attribute
 	omitESS         bool                        // leave the signing-certificate attribute out
+	unsortedAttrs   bool                        // emit the signed attributes in reverse DER order
+	extraAttrs      int                         // add this many filler attributes
 	sigAlgOverride  asn1.ObjectIdentifier       // declare this signature algorithm
+	pssSaltDeclared *int                        // RSASSA-PSS saltLength parameter (nil = 32)
+	pssSaltActual   int                         // salt length used when signing with PSS (0 = 32)
 	duplicateSigner bool                        // two SignerInfos
 	status          int                         // PKIStatus to answer with (0 = granted)
 	failInfoBits    []int                       // failInfo bits to set
@@ -331,7 +342,11 @@ func (s *tsa) token(imprint []byte, nonce *big.Int) []byte {
 		ci.AddASN1ObjectIdentifier(oidSignedData)
 		ci.AddASN1(cbasn1.Tag(0).ContextSpecific().Constructed(), func(c *cryptobyte.Builder) {
 			c.AddASN1(cbasn1.SEQUENCE, func(sd *cryptobyte.Builder) {
-				sd.AddASN1Int64(3)
+				sdVersion := s.sdVersion
+				if sdVersion == 0 {
+					sdVersion = 3
+				}
+				sd.AddASN1Int64(sdVersion)
 				sd.AddASN1(cbasn1.SET, func(set *cryptobyte.Builder) { addAlg(set, oidSHA256, true) })
 				sd.AddASN1(cbasn1.SEQUENCE, func(eci *cryptobyte.Builder) {
 					eci.AddASN1ObjectIdentifier(oidCTTSTInfo)
@@ -343,6 +358,9 @@ func (s *tsa) token(imprint []byte, nonce *big.Int) []byte {
 					sd.AddASN1(cbasn1.Tag(0).ContextSpecific().Constructed(), func(certs *cryptobyte.Builder) {
 						certs.AddBytes(s.cert.Raw)
 						if s.includeRoot {
+							certs.AddBytes(s.root.cert.Raw)
+						}
+						for i := 0; i < s.extraCerts; i++ {
 							certs.AddBytes(s.root.cert.Raw)
 						}
 					})
@@ -387,7 +405,9 @@ func (s *tsa) tstInfo(imprint []byte, nonce *big.Int) []byte {
 		} else {
 			ti.AddASN1GeneralizedTime(s.genTime)
 		}
-		if s.accuracy > 0 {
+		if s.accuracyRaw != nil {
+			ti.AddASN1(cbasn1.SEQUENCE, s.accuracyRaw)
+		} else if s.accuracy > 0 {
 			ti.AddASN1(cbasn1.SEQUENCE, func(acc *cryptobyte.Builder) {
 				secs := int64(s.accuracy / time.Second)
 				rem := s.accuracy % time.Second
@@ -440,7 +460,14 @@ func (s *tsa) signerInfo(tst []byte) []byte {
 	if !s.omitESS {
 		attrs = append(attrs, s.essAttribute())
 	}
-	sort.Slice(attrs, func(i, j int) bool { return bytes.Compare(attrs[i], attrs[j]) < 0 })
+	for i := 0; i < s.extraAttrs; i++ {
+		oid := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 1, i + 1}
+		attrs = append(attrs, attribute(oid, func(v *cryptobyte.Builder) { v.AddASN1NULL() }))
+	}
+	sort.Slice(attrs, func(i, j int) bool {
+		less := bytes.Compare(attrs[i], attrs[j]) < 0
+		return less != s.unsortedAttrs
+	})
 	var set cryptobyte.Builder
 	set.AddASN1(cbasn1.SET, func(b *cryptobyte.Builder) {
 		for _, a := range attrs {
@@ -459,7 +486,11 @@ func (s *tsa) signerInfo(tst []byte) []byte {
 	case schemeRSAPKCS1, schemeRSASHA256:
 		sig, err = rsa.SignPKCS1v15(rand.Reader, s.key.(*rsa.PrivateKey), crypto.SHA256, signed[:])
 	case schemeRSAPSS:
-		sig, err = rsa.SignPSS(rand.Reader, s.key.(*rsa.PrivateKey), crypto.SHA256, signed[:], &rsa.PSSOptions{SaltLength: 32})
+		salt := s.pssSaltActual
+		if salt == 0 {
+			salt = 32
+		}
+		sig, err = rsa.SignPSS(rand.Reader, s.key.(*rsa.PrivateKey), crypto.SHA256, signed[:], &rsa.PSSOptions{SaltLength: salt})
 	}
 	if err != nil {
 		s.t.Fatal(err)
@@ -514,7 +545,11 @@ func (s *tsa) addSignatureAlgorithm(si *cryptobyte.Builder) {
 						addAlg(mgf, oidSHA256, true)
 					})
 				})
-				p.AddASN1(cbasn1.Tag(2).ContextSpecific().Constructed(), func(sl *cryptobyte.Builder) { sl.AddASN1Int64(32) })
+				salt := int64(32)
+				if s.pssSaltDeclared != nil {
+					salt = int64(*s.pssSaltDeclared)
+				}
+				p.AddASN1(cbasn1.Tag(2).ContextSpecific().Constructed(), func(sl *cryptobyte.Builder) { sl.AddASN1Int64(salt) })
 			})
 		})
 	}
@@ -530,37 +565,35 @@ func attribute(oid asn1.ObjectIdentifier, value func(*cryptobyte.Builder)) []byt
 }
 
 // essAttribute builds signing-certificate (v1) or signing-certificate-v2
-// with an issuerSerial, over the signer or, with essMismatch, the root.
+// with an issuerSerial, over the signer or, with essMismatch, the root. The
+// essRootFirst and essRootSecond knobs add an ESSCertID for the root before
+// or after the signer's, essNoDirName drops the directoryName from the
+// issuerSerial, and essPolicies appends a policies field.
 func (s *tsa) essAttribute() []byte {
 	target := s.cert
 	if s.essMismatch {
 		target = s.root.cert
 	}
-	issuerSerial := func(b *cryptobyte.Builder) {
+	issuerSerial := func(b *cryptobyte.Builder, c *x509.Certificate) {
 		b.AddASN1(cbasn1.SEQUENCE, func(is *cryptobyte.Builder) {
 			is.AddASN1(cbasn1.SEQUENCE, func(names *cryptobyte.Builder) {
-				names.AddASN1(cbasn1.Tag(4).ContextSpecific().Constructed(), func(dn *cryptobyte.Builder) {
-					dn.AddBytes(target.RawIssuer)
-				})
-			})
-			is.AddASN1BigInt(target.SerialNumber)
-		})
-	}
-	if s.essV1 {
-		sum := sha1Sum(target.Raw)
-		return attribute(oidSigningCert, func(v *cryptobyte.Builder) {
-			v.AddASN1(cbasn1.SEQUENCE, func(sc *cryptobyte.Builder) {
-				sc.AddASN1(cbasn1.SEQUENCE, func(certs *cryptobyte.Builder) {
-					certs.AddASN1(cbasn1.SEQUENCE, func(id *cryptobyte.Builder) {
-						id.AddASN1OctetString(sum)
-						issuerSerial(id)
+				if s.essNoDirName {
+					names.AddASN1(cbasn1.Tag(2).ContextSpecific(), func(dns *cryptobyte.Builder) {
+						dns.AddBytes([]byte("tsa.example"))
 					})
+					return
+				}
+				names.AddASN1(cbasn1.Tag(4).ContextSpecific().Constructed(), func(dn *cryptobyte.Builder) {
+					dn.AddBytes(c.RawIssuer)
 				})
 			})
+			is.AddASN1BigInt(c.SerialNumber)
 		})
 	}
 	h := crypto.SHA256
-	if s.essV2Hash != nil {
+	if s.essV1 {
+		h = crypto.SHA1
+	} else if s.essV2Hash != nil {
 		switch {
 		case s.essV2Hash.Equal(oidSHA512):
 			h = crypto.SHA512
@@ -568,28 +601,51 @@ func (s *tsa) essAttribute() []byte {
 			h = crypto.SHA1
 		}
 	}
-	hasher := h.New()
-	hasher.Write(target.Raw)
-	sum := hasher.Sum(nil)
-	return attribute(oidSigningCertV2, func(v *cryptobyte.Builder) {
+	essCertID := func(certs *cryptobyte.Builder, c *x509.Certificate) {
+		hasher := h.New()
+		hasher.Write(c.Raw)
+		sum := hasher.Sum(nil)
+		certs.AddASN1(cbasn1.SEQUENCE, func(id *cryptobyte.Builder) {
+			if !s.essV1 && s.essV2Hash != nil {
+				addAlg(id, s.essV2Hash, false)
+			}
+			id.AddASN1OctetString(sum)
+			issuerSerial(id, c)
+		})
+	}
+	oid := oidSigningCertV2
+	if s.essV1 {
+		oid = oidSigningCert
+	}
+	return attribute(oid, func(v *cryptobyte.Builder) {
 		v.AddASN1(cbasn1.SEQUENCE, func(sc *cryptobyte.Builder) {
 			sc.AddASN1(cbasn1.SEQUENCE, func(certs *cryptobyte.Builder) {
-				certs.AddASN1(cbasn1.SEQUENCE, func(id *cryptobyte.Builder) {
-					if s.essV2Hash != nil {
-						addAlg(id, s.essV2Hash, false)
-					}
-					id.AddASN1OctetString(sum)
-					issuerSerial(id)
-				})
+				if s.essRootFirst {
+					essCertID(certs, s.root.cert)
+				}
+				essCertID(certs, target)
+				if s.essRootSecond {
+					essCertID(certs, s.root.cert)
+				}
 			})
+			if s.essPolicies {
+				sc.AddASN1(cbasn1.SEQUENCE, func(pols *cryptobyte.Builder) {
+					pols.AddASN1(cbasn1.SEQUENCE, func(pi *cryptobyte.Builder) {
+						pi.AddASN1ObjectIdentifier(oidSKPolicy)
+					})
+					pols.AddASN1(cbasn1.SEQUENCE, func(pi *cryptobyte.Builder) {
+						pi.AddASN1ObjectIdentifier(oidOtherPolicy)
+						pi.AddASN1(cbasn1.SEQUENCE, func(quals *cryptobyte.Builder) {
+							quals.AddASN1(cbasn1.SEQUENCE, func(q *cryptobyte.Builder) {
+								q.AddASN1ObjectIdentifier(asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 2, 1})
+								q.AddASN1(cbasn1.IA5String, func(u *cryptobyte.Builder) { u.AddBytes([]byte("https://tsa.example/cps")) })
+							})
+						})
+					})
+				})
+			}
 		})
 	})
-}
-
-func sha1Sum(b []byte) []byte {
-	h := crypto.SHA1.New()
-	h.Write(b)
-	return h.Sum(nil)
 }
 
 func bigInt(v int64) *big.Int { return big.NewInt(v) }

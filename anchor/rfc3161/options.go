@@ -37,18 +37,21 @@ func applyOptions(opts []Option) options {
 // http.Client with the default transport).
 func WithHTTPClient(hc *http.Client) Option { return func(o *options) { o.httpClient = hc } }
 
-// WithPolicy asks the TSA to issue under a specific policy (reqPolicy).
-// Combine with [WithRequiredPolicies] on the Verifier to enforce it.
+// WithPolicy asks the TSA to issue under a specific policy (reqPolicy). The
+// [Client] rejects a token issued under any other policy (RFC 3161 section
+// 2.4.2). Set [WithRequiredPolicies] on the Verifier as well so that stored
+// tokens are held to the same policy at audit time.
 func WithPolicy(oid asn1.ObjectIdentifier) Option { return func(o *options) { o.policy = oid } }
 
 // WithTimeout bounds one request of a [Client] (default 30 s).
 func WithTimeout(d time.Duration) Option { return func(o *options) { o.timeout = d } }
 
 // WithCertReq sets the certReq flag of the request (default true). With
-// false the TSA omits its certificate and the token can only be verified
-// with the signer certificate supplied through [WithIntermediates]; the
-// shipped Verifier requires the signer certificate inside the token, so
-// leave this on unless you verify elsewhere.
+// false the TSA omits its certificate from the token, and the shipped
+// [Verifier] then rejects the token: it requires the signer certificate to
+// be inside the token. Certificates supplied through [WithIntermediates] do
+// not substitute for it; they only help to build the chain from that signer
+// to the roots. Leave this on unless the tokens are verified elsewhere.
 func WithCertReq(v bool) Option { return func(o *options) { o.certReq = v } }
 
 // WithUserAgent sets the User-Agent header a [Client] sends.

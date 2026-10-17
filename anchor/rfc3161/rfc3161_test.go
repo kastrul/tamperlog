@@ -14,6 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/cryptobyte"
+	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+
 	"github.com/kastrul/tamperlog/anchor"
 	"github.com/kastrul/tamperlog/anchor/rfc3161"
 )
@@ -545,6 +548,47 @@ func TestParseTokenRejects(t *testing.T) {
 			s2.genTimeRaw = "20261001000000+0200"
 			return s2.token(digestOf("p"), nil)
 		}, "genTime"},
+		{"gentime-bare-dot", func() []byte {
+			s2 := newTSA(t, schemeECDSA)
+			s2.genTimeRaw = "20261001000000.Z"
+			return s2.token(digestOf("p"), nil)
+		}, "genTime"},
+		{"gentime-fraction-trailing-zero", func() []byte {
+			s2 := newTSA(t, schemeECDSA)
+			s2.genTimeRaw = "20261001000000.250Z"
+			return s2.token(digestOf("p"), nil)
+		}, "trailing zeros"},
+		{"gentime-fraction-zero", func() []byte {
+			s2 := newTSA(t, schemeECDSA)
+			s2.genTimeRaw = "20261001000000.0Z"
+			return s2.token(digestOf("p"), nil)
+		}, "trailing zeros"},
+		{"signeddata-version-1", func() []byte {
+			s2 := newTSA(t, schemeECDSA)
+			s2.sdVersion = 1
+			return s2.token(digestOf("p"), nil)
+		}, "SignedData version 1, want 3"},
+		{"signeddata-version-5", func() []byte {
+			s2 := newTSA(t, schemeECDSA)
+			s2.sdVersion = 5
+			return s2.token(digestOf("p"), nil)
+		}, "SignedData version 5, want 3"},
+		{"unsorted-signed-attributes", func() []byte {
+			s2 := newTSA(t, schemeECDSA)
+			s2.unsortedAttrs = true
+			return s2.token(digestOf("p"), nil)
+		}, "DER order"},
+		{"too-many-attributes", func() []byte {
+			s2 := newTSA(t, schemeECDSA)
+			s2.extraAttrs = 62 // 3 real ones + 62 = 65
+			return s2.token(digestOf("p"), nil)
+		}, "more than 64 signed attributes"},
+		{"too-many-certificates", func() []byte {
+			s2 := newTSA(t, schemeECDSA)
+			s2.extraCerts = 32 // signer + 32 = 33
+			return s2.token(digestOf("p"), nil)
+		}, "more than 32"},
+		{"oversized", func() []byte { return make([]byte, rfc3161.MaxTokenSize+1) }, "exceeds"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -552,6 +596,176 @@ func TestParseTokenRejects(t *testing.T) {
 			if err == nil || !errors.Is(err, rfc3161.ErrMalformed) || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want ErrMalformed containing %q", err, tc.want)
 			}
+		})
+	}
+}
+
+func TestParseTokenAcceptsLimits(t *testing.T) {
+	// Exactly at the attribute and certificate limits the token still parses
+	// and verifies; the limits bound malice, not real tokens.
+	s := newTSA(t, schemeECDSA)
+	s.extraAttrs = 61 // 3 + 61 = 64
+	s.extraCerts = 31 // signer + 31 = 32
+	digest := digestOf("limits")
+	if _, err := anchorWith(t, s, digest); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVerifyRejectsOversizedToken(t *testing.T) {
+	s := newTSA(t, schemeECDSA)
+	big := make([]byte, rfc3161.MaxTokenSize+1)
+	_, err := rfc3161.NewVerifier(s.roots()).Verify(context.Background(), digestOf("x"), big)
+	wantInvalid(t, err, "at most")
+	if _, err := rfc3161.ParseToken(big); err == nil || !errors.Is(err, rfc3161.ErrMalformed) {
+		t.Fatalf("ParseToken: err = %v", err)
+	}
+}
+
+func TestParseTokenAccuracyBounds(t *testing.T) {
+	secs := func(v int64) func(*cryptobyte.Builder) {
+		return func(acc *cryptobyte.Builder) { acc.AddASN1Int64(v) }
+	}
+	millis := func(v int64) func(*cryptobyte.Builder) {
+		return func(acc *cryptobyte.Builder) { acc.AddASN1Int64WithTag(v, cbasn1.Tag(0).ContextSpecific()) }
+	}
+	micros := func(v int64) func(*cryptobyte.Builder) {
+		return func(acc *cryptobyte.Builder) { acc.AddASN1Int64WithTag(v, cbasn1.Tag(1).ContextSpecific()) }
+	}
+	cases := []struct {
+		name string
+		raw  func(*cryptobyte.Builder)
+		want string // "" when the token must parse
+		dur  time.Duration
+	}{
+		// 9,223,372,037 s * 1e9 wraps a time.Duration negative; it must be
+		// rejected at parse time, never reach WithMaxAccuracy as a negative.
+		{"seconds-overflow", secs(9_223_372_037), "accuracy seconds", 0},
+		{"seconds-negative", secs(-1), "accuracy seconds", 0},
+		{"seconds-max", secs(1 << 31), "", (1 << 31) * time.Second},
+		{"seconds-above-max", secs(1<<31 + 1), "accuracy seconds", 0},
+		{"millis-zero", millis(0), "accuracy millis 0", 0},
+		{"millis-1000", millis(1000), "accuracy millis 1000", 0},
+		{"millis-negative", millis(-5), "accuracy millis", 0},
+		{"millis-999", millis(999), "", 999 * time.Millisecond},
+		{"micros-zero", micros(0), "accuracy micros 0", 0},
+		{"micros-1000", micros(1000), "accuracy micros 1000", 0},
+		{"micros-1", micros(1), "", time.Microsecond},
+		{"empty", func(*cryptobyte.Builder) {}, "", 0},
+		{"all-max", func(acc *cryptobyte.Builder) {
+			secs(1 << 31)(acc)
+			millis(999)(acc)
+			micros(999)(acc)
+		}, "", (1<<31)*time.Second + 999*time.Millisecond + 999*time.Microsecond},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTSA(t, schemeECDSA)
+			s.accuracyRaw = tc.raw
+			tok, err := rfc3161.ParseToken(s.token(digestOf("acc"), nil))
+			if tc.want != "" {
+				if err == nil || !errors.Is(err, rfc3161.ErrMalformed) || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("err = %v, want ErrMalformed containing %q", err, tc.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseToken: %v", err)
+			}
+			if tok.Accuracy != tc.dur {
+				t.Fatalf("Accuracy = %s, want %s", tok.Accuracy, tc.dur)
+			}
+		})
+	}
+}
+
+func TestVerifyMaxAccuracyRejectsOverflowingAccuracy(t *testing.T) {
+	s := newTSA(t, schemeECDSA)
+	s.accuracyRaw = func(acc *cryptobyte.Builder) { acc.AddASN1Int64(9_223_372_037) }
+	_, err := anchorWith(t, s, digestOf("overflow"), rfc3161.WithMaxAccuracy(time.Second))
+	if err == nil || !strings.Contains(err.Error(), "accuracy") {
+		t.Fatalf("err = %v, want an accuracy rejection", err)
+	}
+}
+
+func TestVerifyPSSSaltLength(t *testing.T) {
+	intp := func(v int) *int { return &v }
+	cases := []struct {
+		name     string
+		declared *int
+		actual   int
+		want     string // "" when the token must verify
+	}{
+		{"declared-32-actual-32", intp(32), 32, ""},
+		{"declared-20-actual-20", intp(20), 20, ""},
+		{"declared-32-actual-20", intp(32), 20, "RSASSA-PSS"},
+		{"declared-20-actual-32", intp(20), 32, "RSASSA-PSS"},
+		{"declared-0", intp(0), 32, "salt length 0"},
+		{"declared-negative", intp(-1), 32, "salt length"},
+		{"declared-513", intp(513), 32, "salt length"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTSA(t, schemeRSAPSS)
+			s.pssSaltDeclared = tc.declared
+			s.pssSaltActual = tc.actual
+			_, err := anchorWith(t, s, digestOf("pss"))
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Anchor: %v", err)
+				}
+				return
+			}
+			wantInvalid(t, err, tc.want)
+		})
+	}
+}
+
+func TestClientRejectsPolicyMismatch(t *testing.T) {
+	s := newTSA(t, schemeECDSA)
+	s.policy = oidOtherPolicy
+	srv := s.serve()
+	_, err := rfc3161.New(srv.URL, rfc3161.WithPolicy(oidSKPolicy)).Anchor(context.Background(), digestOf("pol"))
+	if err == nil || !strings.Contains(err.Error(), "policy") || !strings.Contains(err.Error(), oidOtherPolicy.String()) {
+		t.Fatalf("err = %v, want a policy mismatch naming %s", err, oidOtherPolicy)
+	}
+	// Without a requested policy the client accepts whatever the TSA chose.
+	if _, err := rfc3161.New(srv.URL).Anchor(context.Background(), digestOf("pol")); err != nil {
+		t.Fatalf("Anchor without WithPolicy: %v", err)
+	}
+	// The requested policy itself passes.
+	s.policy = oidSKPolicy
+	if _, err := rfc3161.New(srv.URL, rfc3161.WithPolicy(oidSKPolicy)).Anchor(context.Background(), digestOf("pol")); err != nil {
+		t.Fatalf("Anchor with matching policy: %v", err)
+	}
+}
+
+func TestVerifyESSCertIDStructure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*tsa)
+		want  string // "" when the token must verify
+	}{
+		{"v2-with-policies", func(s *tsa) { s.essPolicies = true }, ""},
+		{"v1-with-policies", func(s *tsa) { s.essV1 = true; s.essPolicies = true }, ""},
+		{"v2-signer-then-root", func(s *tsa) { s.essRootSecond = true }, ""},
+		{"v1-signer-then-root", func(s *tsa) { s.essV1 = true; s.essRootSecond = true }, ""},
+		{"v2-root-then-signer", func(s *tsa) { s.essRootFirst = true }, "certHash does not match"},
+		{"v1-root-then-signer", func(s *tsa) { s.essV1 = true; s.essRootFirst = true }, "certHash does not match"},
+		{"v2-issuer-serial-without-directory-name", func(s *tsa) { s.essNoDirName = true }, "directoryName"},
+		{"v1-issuer-serial-without-directory-name", func(s *tsa) { s.essV1 = true; s.essNoDirName = true }, "directoryName"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTSA(t, schemeECDSA)
+			tc.setup(s)
+			_, err := anchorWith(t, s, digestOf("ess"))
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Anchor: %v", err)
+				}
+				return
+			}
+			wantInvalid(t, err, tc.want)
 		})
 	}
 }

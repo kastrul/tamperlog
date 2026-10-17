@@ -55,13 +55,15 @@ func invalid(format string, a ...any) error {
 // Verify checks that token is a TimeStampToken over digest, the SHA-256 of a
 // seal's canonical bytes, issued by an authority that chains to the pinned
 // roots, and returns what it attests. Every failure wraps
-// [anchor.ErrInvalidProof]. The checks are, in order: structure
-// ([ParseToken]), message imprint, signer certificate present, CMS signature
-// over the signed attributes, message-digest attribute against the TSTInfo,
-// content-type attribute, ESSCertID or ESSCertIDv2 against the signer
-// certificate, chain to roots at genTime with the timeStamping key purpose,
-// critical extended key usage on the signer, required policies, maximum
-// accuracy, and finally the qualified-status hook when one is configured.
+// [anchor.ErrInvalidProof]. The checks are, in order: size (at most
+// [MaxTokenSize]) and structure ([ParseToken]), message imprint, signer
+// certificate present, CMS signature over the signed attributes,
+// message-digest attribute against the TSTInfo, content-type attribute,
+// ESSCertID or ESSCertIDv2 against the signer certificate, chain to roots at
+// genTime with the timeStamping key purpose, critical extended key usage on
+// the signer, required policies, maximum accuracy, and finally the
+// qualified-status hook when one is configured. The context is consulted
+// before parsing and again before the signature and chain work.
 func (v *Verifier) Verify(ctx context.Context, digest, token []byte) (anchor.Attestation, error) {
 	if err := ctx.Err(); err != nil {
 		return anchor.Attestation{}, invalid("%v", err)
@@ -69,8 +71,14 @@ func (v *Verifier) Verify(ctx context.Context, digest, token []byte) (anchor.Att
 	if v.roots == nil {
 		return anchor.Attestation{}, invalid("no roots configured")
 	}
+	if len(token) > MaxTokenSize {
+		return anchor.Attestation{}, invalid("token is %d bytes, at most %d allowed", len(token), MaxTokenSize)
+	}
 	tok, err := ParseToken(token)
 	if err != nil {
+		return anchor.Attestation{}, invalid("%v", err)
+	}
+	if err := ctx.Err(); err != nil {
 		return anchor.Attestation{}, invalid("%v", err)
 	}
 	if len(digest) != sha256.Size {
@@ -238,9 +246,16 @@ func ecdsaHashFor(oid asn1.ObjectIdentifier) crypto.Hash {
 	}
 }
 
+// maxPSSSaltLength bounds the declared salt length; larger values are
+// meaningless for any accepted key and hash (RFC 8017 section 9.1.1).
+const maxPSSSaltLength = 512
+
 // parsePSSParams reads RSASSA-PSS-params (RFC 4055 section 3.1). The hash
 // must be stated (the SHA-1 default is not accepted), the mask generation
-// function must be MGF1 with the same hash, and the trailer field must be 1.
+// function must be MGF1 with the same hash, the trailer field must be 1, and
+// the salt length must be 1..512. A declared salt length of 0 is rejected: it
+// would map onto rsa.PSSSaltLengthAuto, which accepts a signature made with
+// any salt length instead of the declared one, and no TSA signs without salt.
 func parsePSSParams(alg algorithmIdentifier) (*rsa.PSSOptions, crypto.Hash, error) {
 	if !alg.HasParams {
 		return nil, 0, fmt.Errorf("RSASSA-PSS without parameters")
@@ -283,9 +298,14 @@ func parsePSSParams(alg algorithmIdentifier) (*rsa.PSSOptions, crypto.Hash, erro
 	if !params.ReadOptionalASN1Integer(&trailer, cbasn1.Tag(3).ContextSpecific().Constructed(), int64(1)) {
 		return nil, 0, fmt.Errorf("RSASSA-PSS trailer field malformed")
 	}
-	if !params.Empty() || trailer != 1 || salt < 0 || salt > 512 {
+	if !params.Empty() || trailer != 1 {
 		return nil, 0, fmt.Errorf("RSASSA-PSS parameters out of range")
 	}
+	if salt < 1 || salt > maxPSSSaltLength {
+		return nil, 0, fmt.Errorf("RSASSA-PSS salt length %d out of range 1..%d", salt, maxPSSSaltLength)
+	}
+	// SaltLength is passed through exactly; rsa.VerifyPSS then requires the
+	// signature's salt to be precisely this long.
 	return &rsa.PSSOptions{SaltLength: int(salt), Hash: h}, h, nil
 }
 
@@ -350,36 +370,83 @@ func checkSignedAttributes(sd *signedData, cert *x509.Certificate) error {
 	return nil
 }
 
-// checkESSCertID checks that the first ESSCertID (RFC 2634) or ESSCertIDv2
-// (RFC 5035) in a SigningCertificate attribute value identifies cert: the
-// certificate hash under the stated algorithm (SHA-1 for v1, SHA-256 by
-// default for v2) and, when present, the issuer and serial number.
+// checkESSCertID parses a whole SigningCertificate (RFC 2634 section 5.4) or
+// SigningCertificateV2 (RFC 5035 section 3) attribute value and checks that
+// its first ESSCertID identifies cert. RFC 5035 states that the first entry
+// is the signer's certificate; later entries, which may name the rest of the
+// chain, and the optional policies are parsed for well-formedness only.
+// Identification is by certificate hash under the stated algorithm (SHA-1
+// for v1, SHA-256 by default for v2) and, when issuerSerial is present, by
+// at least one directoryName equal to the signer's issuer together with the
+// signer's serial number.
 func checkESSCertID(value []byte, v2 bool, cert *x509.Certificate) error {
 	s := cryptobyte.String(value)
-	var sc, certs, id cryptobyte.String
+	var sc, certs cryptobyte.String
 	if !s.ReadASN1(&sc, cbasn1.SEQUENCE) || !s.Empty() || !sc.ReadASN1(&certs, cbasn1.SEQUENCE) {
 		return fmt.Errorf("malformed")
 	}
-	if !certs.ReadASN1(&id, cbasn1.SEQUENCE) {
+	if certs.Empty() {
 		return fmt.Errorf("no ESSCertID")
 	}
+	first := true
+	for !certs.Empty() {
+		var id cryptobyte.String
+		if !certs.ReadASN1(&id, cbasn1.SEQUENCE) {
+			return fmt.Errorf("malformed ESSCertID")
+		}
+		if first {
+			if err := matchESSCertID(id, v2, cert); err != nil {
+				return err
+			}
+			first = false
+			continue
+		}
+		if err := skipESSCertID(id, v2); err != nil {
+			return err
+		}
+	}
+	var policies cryptobyte.String
+	var present bool
+	if !sc.ReadOptionalASN1(&policies, &present, cbasn1.SEQUENCE) || !sc.Empty() {
+		return fmt.Errorf("malformed policies")
+	}
+	if present {
+		if err := checkPolicyInformation(policies); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readESSCertHash reads the optional hashAlgorithm (v2 only) and the certHash
+// of one ESSCertID and returns the hash to use and the expected digest.
+func readESSCertHash(id *cryptobyte.String, v2 bool) (crypto.Hash, []byte, error) {
 	h := crypto.SHA1
 	if v2 {
 		h = crypto.SHA256
 		if id.PeekASN1Tag(cbasn1.SEQUENCE) {
-			alg, err := readAlgorithmIdentifier(&id)
+			alg, err := readAlgorithmIdentifier(id)
 			if err != nil || !alg.paramsAbsentOrNull() {
-				return fmt.Errorf("malformed hashAlgorithm")
+				return 0, nil, fmt.Errorf("malformed hashAlgorithm")
 			}
 			var ok bool
 			if h, ok = certHash(alg.OID); !ok {
-				return fmt.Errorf("unsupported hash %s", alg.OID)
+				return 0, nil, fmt.Errorf("unsupported hash %s", alg.OID)
 			}
 		}
 	}
 	var want cryptobyte.String
-	if !id.ReadASN1(&want, cbasn1.OCTET_STRING) {
-		return fmt.Errorf("malformed certHash")
+	if !id.ReadASN1(&want, cbasn1.OCTET_STRING) || len(want) != h.Size() {
+		return 0, nil, fmt.Errorf("malformed certHash")
+	}
+	return h, []byte(want), nil
+}
+
+// matchESSCertID checks that the ESSCertID identifies cert.
+func matchESSCertID(id cryptobyte.String, v2 bool, cert *x509.Certificate) error {
+	h, want, err := readESSCertHash(&id, v2)
+	if err != nil {
+		return err
 	}
 	hasher := h.New()
 	hasher.Write(cert.Raw)
@@ -394,6 +461,15 @@ func checkESSCertID(value []byte, v2 bool, cert *x509.Certificate) error {
 	if !present {
 		return nil
 	}
+	return matchIssuerSerial(is, cert)
+}
+
+// matchIssuerSerial checks an IssuerSerial against cert: the serial must be
+// the certificate's, every directoryName in the GeneralNames must equal the
+// certificate's issuer, and at least one directoryName must be present. Other
+// name forms cannot be compared to an issuer Name and are rejected if they
+// are all there is.
+func matchIssuerSerial(is cryptobyte.String, cert *x509.Certificate) error {
 	var names cryptobyte.String
 	if !is.ReadASN1(&names, cbasn1.SEQUENCE) {
 		return fmt.Errorf("malformed issuerSerial")
@@ -405,14 +481,80 @@ func checkESSCertID(value []byte, v2 bool, cert *x509.Certificate) error {
 	if serial.Cmp(cert.SerialNumber) != 0 {
 		return fmt.Errorf("issuerSerial serial does not match the signer certificate")
 	}
+	matched := false
 	for !names.Empty() {
 		var name cryptobyte.String
 		var tag cbasn1.Tag
 		if !names.ReadAnyASN1(&name, &tag) {
 			return fmt.Errorf("malformed issuerSerial issuer")
 		}
-		if tag == cbasn1.Tag(4).ContextSpecific().Constructed() && !bytes.Equal(name, cert.RawIssuer) {
+		if tag != cbasn1.Tag(4).ContextSpecific().Constructed() {
+			continue
+		}
+		if !bytes.Equal(name, cert.RawIssuer) {
 			return fmt.Errorf("issuerSerial issuer does not match the signer certificate")
+		}
+		matched = true
+	}
+	if !matched {
+		return fmt.Errorf("issuerSerial names no directoryName to compare with the signer's issuer")
+	}
+	return nil
+}
+
+// skipESSCertID checks the structure of an ESSCertID that is not the first
+// one: hash, certHash and an optional, well-formed IssuerSerial.
+func skipESSCertID(id cryptobyte.String, v2 bool) error {
+	if _, _, err := readESSCertHash(&id, v2); err != nil {
+		return err
+	}
+	var is cryptobyte.String
+	var present bool
+	if !id.ReadOptionalASN1(&is, &present, cbasn1.SEQUENCE) || !id.Empty() {
+		return fmt.Errorf("malformed issuerSerial")
+	}
+	if !present {
+		return nil
+	}
+	var names cryptobyte.String
+	if !is.ReadASN1(&names, cbasn1.SEQUENCE) {
+		return fmt.Errorf("malformed issuerSerial")
+	}
+	for !names.Empty() {
+		var name cryptobyte.String
+		var tag cbasn1.Tag
+		if !names.ReadAnyASN1(&name, &tag) {
+			return fmt.Errorf("malformed issuerSerial issuer")
+		}
+	}
+	var serial cryptobyte.String
+	if !is.ReadASN1(&serial, cbasn1.INTEGER) || !is.Empty() {
+		return fmt.Errorf("malformed issuerSerial")
+	}
+	return nil
+}
+
+// checkPolicyInformation checks the structure of the optional policies field:
+// a SEQUENCE OF PolicyInformation (RFC 5280 section 4.2.1.4), each a
+// policyIdentifier with optional qualifiers. The contents carry no meaning
+// for verification.
+func checkPolicyInformation(policies cryptobyte.String) error {
+	for !policies.Empty() {
+		var pi cryptobyte.String
+		if !policies.ReadASN1(&pi, cbasn1.SEQUENCE) {
+			return fmt.Errorf("malformed PolicyInformation")
+		}
+		var oid asn1.ObjectIdentifier
+		if !pi.ReadASN1ObjectIdentifier(&oid) {
+			return fmt.Errorf("malformed PolicyInformation policyIdentifier")
+		}
+		var quals cryptobyte.String
+		var present bool
+		if !pi.ReadOptionalASN1(&quals, &present, cbasn1.SEQUENCE) || !pi.Empty() {
+			return fmt.Errorf("malformed PolicyInformation policyQualifiers")
+		}
+		if present && quals.Empty() {
+			return fmt.Errorf("malformed PolicyInformation policyQualifiers")
 		}
 	}
 	return nil

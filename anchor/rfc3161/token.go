@@ -17,6 +17,18 @@ import (
 // ErrMalformed wraps every parse failure of a token, request or response.
 var ErrMalformed = errors.New("rfc3161: malformed")
 
+// MaxTokenSize bounds the DER a [ParseToken] or [Verifier.Verify] accepts.
+// It equals [MaxResponseSize], so every token a [Client] returns fits.
+const MaxTokenSize = 1 << 20
+
+// Structural limits on a token. A real token has three or four signed
+// attributes and one to four certificates; anything beyond these bounds is
+// rejected before it is parsed further.
+const (
+	maxAttributes   = 64
+	maxCertificates = 32
+)
+
 func malformed(format string, a ...any) error {
 	return fmt.Errorf("%w: %s", ErrMalformed, fmt.Sprintf(format, a...))
 }
@@ -93,8 +105,12 @@ type attribute struct {
 // token is well-formed DER without trailing bytes, is a SignedData carrying
 // id-ct-TSTInfo with exactly one SignerInfo and signed attributes, that the
 // TSTInfo is version 1 with no critical extensions, and that any included
-// certificates parse. Nothing is verified; use [Verifier.Verify] for that.
+// certificates parse. Tokens larger than [MaxTokenSize] are rejected
+// unread. Nothing is verified; use [Verifier.Verify] for that.
 func ParseToken(der []byte) (*Token, error) {
+	if len(der) > MaxTokenSize {
+		return nil, malformed("token: %d bytes exceeds %d", len(der), MaxTokenSize)
+	}
 	sd, err := parseSignedData(der)
 	if err != nil {
 		return nil, err
@@ -140,8 +156,13 @@ func parseSignedData(der []byte) (*signedData, error) {
 	if out.version, err = readSmallInt(&sd, "SignedData version"); err != nil {
 		return nil, malformed("%v", err)
 	}
-	if out.version < 1 || out.version > 5 {
-		return nil, malformed("SignedData version %d", out.version)
+	// RFC 5652 section 5.1: with no attribute certificates, no other
+	// certificate choices and an eContentType other than id-data, the
+	// version is 3. A token's eContentType is id-ct-TSTInfo and
+	// parseCertificateSet admits only the certificate choice, so no other
+	// value is correct.
+	if out.version != 3 {
+		return nil, malformed("SignedData version %d, want 3", out.version)
 	}
 	var das cryptobyte.String
 	if !sd.ReadASN1(&das, cbasn1.SET) {
@@ -219,6 +240,9 @@ func parseEncapContentInfo(sd *cryptobyte.String, out *signedData) error {
 func parseCertificateSet(set cryptobyte.String) ([]*x509.Certificate, error) {
 	var certs []*x509.Certificate
 	for !set.Empty() {
+		if len(certs) >= maxCertificates {
+			return nil, malformed("certificates: more than %d", maxCertificates)
+		}
 		var el cryptobyte.String
 		if !set.PeekASN1Tag(cbasn1.SEQUENCE) {
 			return nil, malformed("certificates: unsupported CertificateChoices")
@@ -312,20 +336,37 @@ func parseSignerInfo(sis *cryptobyte.String) (signerInfo, error) {
 }
 
 // parseAttributes reads a SET OF Attribute. RFC 5652 section 5.3 forbids two
-// attributes of the same type and requires at least one value each.
+// attributes of the same type and requires at least one value each. The
+// signature covers the DER of this set, so its elements must be in DER order
+// (X.690 section 11.6: ascending as octet strings); a set that is not is
+// rejected rather than accepted under an encoding the signer never produced.
 func parseAttributes(set cryptobyte.String) ([]attribute, error) {
 	var attrs []attribute
+	seen := make(map[string]struct{})
+	var prev []byte
 	for !set.Empty() {
-		var a cryptobyte.String
-		if !set.ReadASN1(&a, cbasn1.SEQUENCE) {
+		if len(attrs) >= maxAttributes {
+			return nil, malformed("more than %d signed attributes", maxAttributes)
+		}
+		var el cryptobyte.String
+		if !set.ReadASN1Element(&el, cbasn1.SEQUENCE) {
+			return nil, malformed("Attribute")
+		}
+		if prev != nil && bytes.Compare(prev, el) >= 0 {
+			return nil, malformed("signed attributes are not in DER order")
+		}
+		prev = el
+		a := el
+		var body cryptobyte.String
+		if !a.ReadASN1(&body, cbasn1.SEQUENCE) {
 			return nil, malformed("Attribute")
 		}
 		var attr attribute
-		if !a.ReadASN1ObjectIdentifier(&attr.oid) {
+		if !body.ReadASN1ObjectIdentifier(&attr.oid) {
 			return nil, malformed("Attribute attrType")
 		}
 		var values cryptobyte.String
-		if !a.ReadASN1(&values, cbasn1.SET) || !a.Empty() {
+		if !body.ReadASN1(&values, cbasn1.SET) || !body.Empty() {
 			return nil, malformed("Attribute %s attrValues", attr.oid)
 		}
 		for !values.Empty() {
@@ -339,11 +380,11 @@ func parseAttributes(set cryptobyte.String) ([]attribute, error) {
 		if len(attr.values) == 0 {
 			return nil, malformed("Attribute %s has no value", attr.oid)
 		}
-		for _, prev := range attrs {
-			if prev.oid.Equal(attr.oid) {
-				return nil, malformed("Attribute %s appears twice", attr.oid)
-			}
+		key := attr.oid.String()
+		if _, dup := seen[key]; dup {
+			return nil, malformed("Attribute %s appears twice", attr.oid)
 		}
+		seen[key] = struct{}{}
 		attrs = append(attrs, attr)
 	}
 	return attrs, nil
@@ -474,8 +515,17 @@ func readMessageImprint(s *cryptobyte.String) (MessageImprint, error) {
 	return out, nil
 }
 
+// Bounds on the Accuracy fields. RFC 3161 section 2.4.2 declares millis and
+// micros as INTEGER (1..999): when present they are never 0 (which would be
+// omitted) and never 1000 (which would carry into the next field). Seconds
+// are capped far below what fits a time.Duration so the sum cannot overflow.
+const (
+	maxAccuracySeconds = int64(1) << 31
+	maxAccuracyFrac    = 999
+)
+
 // readAccuracy reads the optional Accuracy SEQUENCE and returns it as a
-// duration. Millis and micros are bounded to 0..999 as the schema intends.
+// duration. Each field is range-checked before conversion.
 func readAccuracy(s *cryptobyte.String) (time.Duration, error) {
 	var acc cryptobyte.String
 	var present bool
@@ -490,20 +540,30 @@ func readAccuracy(s *cryptobyte.String) (time.Duration, error) {
 		if !acc.ReadASN1Integer(&seconds) {
 			return 0, malformed("accuracy seconds")
 		}
+		if seconds < 0 || seconds > maxAccuracySeconds {
+			return 0, malformed("accuracy seconds %d out of range 0..%d", seconds, maxAccuracySeconds)
+		}
 	}
-	if acc.PeekASN1Tag(cbasn1.Tag(0).ContextSpecific()) && !acc.ReadASN1Int64WithTag(&millis, cbasn1.Tag(0).ContextSpecific()) {
-		return 0, malformed("accuracy millis")
+	if acc.PeekASN1Tag(cbasn1.Tag(0).ContextSpecific()) {
+		if !acc.ReadASN1Int64WithTag(&millis, cbasn1.Tag(0).ContextSpecific()) {
+			return 0, malformed("accuracy millis")
+		}
+		if millis < 1 || millis > maxAccuracyFrac {
+			return 0, malformed("accuracy millis %d out of range 1..%d", millis, maxAccuracyFrac)
+		}
 	}
-	if acc.PeekASN1Tag(cbasn1.Tag(1).ContextSpecific()) && !acc.ReadASN1Int64WithTag(&micros, cbasn1.Tag(1).ContextSpecific()) {
-		return 0, malformed("accuracy micros")
+	if acc.PeekASN1Tag(cbasn1.Tag(1).ContextSpecific()) {
+		if !acc.ReadASN1Int64WithTag(&micros, cbasn1.Tag(1).ContextSpecific()) {
+			return 0, malformed("accuracy micros")
+		}
+		if micros < 1 || micros > maxAccuracyFrac {
+			return 0, malformed("accuracy micros %d out of range 1..%d", micros, maxAccuracyFrac)
+		}
 	}
 	if !acc.Empty() {
 		return 0, malformed("accuracy: trailing bytes")
 	}
-	const maxSeconds = int64(1 << 40) // far beyond any plausible accuracy, keeps the duration from overflowing
-	if seconds < 0 || seconds > maxSeconds || millis < 0 || millis > 999 || micros < 0 || micros > 999 {
-		return 0, malformed("accuracy out of range: %ds %dms %dus", seconds, millis, micros)
-	}
+	// seconds <= 2^31 so seconds*1e9 < 2^61; the fractions add < 1e9.
 	return time.Duration(seconds)*time.Second + time.Duration(millis)*time.Millisecond + time.Duration(micros)*time.Microsecond, nil
 }
 

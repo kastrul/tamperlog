@@ -129,7 +129,9 @@ func certHash(oid asn1.ObjectIdentifier) (crypto.Hash, bool) {
 }
 
 // readGeneralizedTime reads a GeneralizedTime in the form RFC 3161 section
-// 2.4.2 requires: YYYYMMDDHHMMSS[.f+]Z, UTC only, seconds present.
+// 2.4.2 and DER (X.690 section 11.7) require: YYYYMMDDHHMMSS[.f+]Z, UTC
+// only, seconds present, and a fraction, when there is one, with at least
+// one digit and no trailing zeros.
 func readGeneralizedTime(s *cryptobyte.String) (time.Time, error) {
 	var raw cryptobyte.String
 	if !s.ReadASN1(&raw, cbasn1.GeneralizedTime) {
@@ -150,6 +152,9 @@ func parseGeneralizedTime(v string) (time.Time, error) {
 			return time.Time{}, fmt.Errorf("GeneralizedTime %q: bad fraction", v)
 		}
 		frac := body[15:]
+		if frac[len(frac)-1] == '0' {
+			return time.Time{}, fmt.Errorf("GeneralizedTime %q: fraction has trailing zeros", v)
+		}
 		scale := 1_000_000_000
 		for _, c := range frac {
 			if c < '0' || c > '9' {
