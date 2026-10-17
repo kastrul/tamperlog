@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<TrustServiceStatusList xmlns="http://uri.etsi.org/02231/v2#" xmlns:ns2="http://www.w3.org/2000/09/xmldsig#" xmlns:ns3="http://uri.etsi.org/02231/v2/additionaltypes#" xmlns:ns4="http://uri.etsi.org/01903/v1.3.2#" Id="ID0001" TSLTag="http://uri.etsi.org/19612/TSLTag">
+    <SchemeInformation>
+        <TSLVersionIdentifier>6</TSLVersionIdentifier>
+        <TSLSequenceNumber>88</TSLSequenceNumber>
+        <TSLType>http://uri.etsi.org/TrstSvc/TrustedList/TSLType/EUgeneric</TSLType>
+        <SchemeOperatorName>
+            <Name xml:lang="et">Näidis Infosüsteemi Amet</Name>
+            <Name xml:lang="en">Example Information System Authority</Name>
+        </SchemeOperatorName>
+        <SchemeTerritory>EE</SchemeTerritory>
+        <PointersToOtherTSL>
+            <OtherTSLPointer>
+                <TSLLocation>https://example.test/lotl/eu-lotl.xml</TSLLocation>
+                <AdditionalInformation>
+                    <OtherInformation>
+                        <SchemeTerritory>EU</SchemeTerritory>
+                    </OtherInformation>
+                    <OtherInformation>
+                        <ns3:MimeType>application/vnd.etsi.tsl+xml</ns3:MimeType>
+                    </OtherInformation>
+                </AdditionalInformation>
+            </OtherTSLPointer>
+        </PointersToOtherTSL>
+        <ListIssueDateTime>2026-09-01T09:00:00Z</ListIssueDateTime>
+        <NextUpdate>
+            <dateTime>2027-03-01T09:00:00Z</dateTime>
+        </NextUpdate>
+    </SchemeInformation>
+    <TrustServiceProviderList>
+        <TrustServiceProvider>
+            <TSPInformation>
+                <TSPName>
+                    <Name xml:lang="et">Näidis Kvalifitseeritud Teenused AS</Name>
+                    <Name xml:lang="en">Example Qualified Services AS</Name>
+                </TSPName>
+                <TSPTradeName>
+                    <Name xml:lang="en">NTREE-10000000</Name>
+                </TSPTradeName>
+                <TSPAddress>
+                    <PostalAddresses>
+                        <PostalAddress xml:lang="en">
+                            <StreetAddress>Näidise 1</StreetAddress>
+                            <Locality>Tallinn</Locality>
+                            <PostalCode>10000</PostalCode>
+                            <CountryName>EE</CountryName>
+                        </PostalAddress>
+                    </PostalAddresses>
+                </TSPAddress>
+                <TSPInformationURI>
+                    <URI xml:lang="en">https://example.test/repository</URI>
+                </TSPInformationURI>
+            </TSPInformation>
+            <TSPServices>
+                <TSPService>
+                    <ServiceInformation>
+                        <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST</ServiceTypeIdentifier>
+                        <ServiceName>
+                            <Name xml:lang="en">Example Qualified TSA</Name>
+                        </ServiceName>
+                        <ServiceDigitalIdentity>
+                            <DigitalId>
+                                <X509Certificate>MIIB9TCCAZugAwIBAgIBATAKBggqhkjOPQQDAjBiMQswCQYDVQQGEwJFRTEmMCQGA1UEChMdRXhhbXBsZSBRdWFsaWZpZWQgU2VydmljZXMgQVMxKzApBgNVBAMTIkV4YW1wbGUgUXVhbGlmaWVkIFNlcnZpY2VzIFJvb3QgQ0EwHhcNMTYwMTAxMDAwMDAwWhcNNDYwMTAxMDAwMDAwWjBiMQswCQYDVQQGEwJFRTEmMCQGA1UEChMdRXhhbXBsZSBRdWFsaWZpZWQgU2VydmljZXMgQVMxKzApBgNVBAMTIkV4YW1wbGUgUXVhbGlmaWVkIFNlcnZpY2VzIFJvb3QgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ50TUWGOx2xD4qfF+ZDTA4UATVUCj0Sob2q8EuR9v7PojMCEAGSzjAHwwTn+O4JGth0YaBOe6Li0VS4tiQ2Giwo0IwQDAOBgNVHQ8BAf8EBAMCAoQwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQU7gECAwQFBgcICQoLDA0ODxAREhMwCgYIKoZIzj0EAwIDSAAwRQIgTC9bsT5QUqMV7HxSnTu5KUtE62N+8smSwg8WmuABNoECIQDIOwtzHF1gOf0/zRDRdX3hPGNm8C1unk45lskEtlTtnQ==</X509Certificate>
+                            </DigitalId>
+                            <DigitalId>
+                                <X509SubjectName>CN=Example Qualified Services Root CA, O=Example Qualified Services AS, C=EE</X509SubjectName>
+                            </DigitalId>
+                        </ServiceDigitalIdentity>
+                        <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn</ServiceStatus>
+                        <StatusStartingTime>2030-01-01T00:00:00Z</StatusStartingTime>
+                        <ServiceInformationExtensions>
+                            <Extension Critical="false">
+                                <AdditionalServiceInformation>
+                                    <URI xml:lang="en">http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/ForeSignatures</URI>
+                                </AdditionalServiceInformation>
+                            </Extension>
+                        </ServiceInformationExtensions>
+                    </ServiceInformation>
+                    <ServiceHistory>
+                        <ServiceHistoryInstance>
+                            <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST</ServiceTypeIdentifier>
+                            <ServiceName>
+                                <Name xml:lang="en">Example Qualified TSA</Name>
+                            </ServiceName>
+                            <ServiceDigitalIdentity>
+                                <DigitalId>
+                                    <X509SubjectName>CN=Example Qualified Services Root CA, O=Example Qualified Services AS, C=EE</X509SubjectName>
+                                </DigitalId>
+                            </ServiceDigitalIdentity>
+                            <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted</ServiceStatus>
+                            <StatusStartingTime>2016-07-01T00:00:00Z</StatusStartingTime>
+                        </ServiceHistoryInstance>
+                        <ServiceHistoryInstance>
+                            <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/TSA</ServiceTypeIdentifier>
+                            <ServiceName>
+                                <Name xml:lang="en">Example Qualified TSA</Name>
+                            </ServiceName>
+                            <ServiceDigitalIdentity>
+                                <DigitalId>
+                                    <X509SubjectName>CN=Example Qualified Services Root CA, O=Example Qualified Services AS, C=EE</X509SubjectName>
+                                </DigitalId>
+                            </ServiceDigitalIdentity>
+                            <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/undersupervision</ServiceStatus>
+                            <StatusStartingTime>2016-01-15T00:00:00Z</StatusStartingTime>
+                        </ServiceHistoryInstance>
+                    </ServiceHistory>
+                </TSPService>
+                <TSPService>
+                    <ServiceInformation>
+                        <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/TSA</ServiceTypeIdentifier>
+                        <ServiceName>
+                            <Name xml:lang="en">Example Legacy TSA</Name>
+                        </ServiceName>
+                        <ServiceDigitalIdentity>
+                            <DigitalId>
+                                <X509SubjectName>CN=Example Legacy TSA, O=Example Qualified Services AS, C=EE</X509SubjectName>
+                            </DigitalId>
+                        </ServiceDigitalIdentity>
+                        <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/recognisedatnationallevel</ServiceStatus>
+                        <StatusStartingTime>2014-03-01T00:00:00Z</StatusStartingTime>
+                    </ServiceInformation>
+                </TSPService>
+            </TSPServices>
+        </TrustServiceProvider>
+        <TrustServiceProvider>
+            <TSPInformation>
+                <TSPName>
+                    <Name xml:lang="et">Näidis Ajatemplid OÜ</Name>
+                </TSPName>
+            </TSPInformation>
+            <TSPServices>
+                <TSPService>
+                    <ServiceInformation>
+                        <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST</ServiceTypeIdentifier>
+                        <ServiceName>
+                            <Name xml:lang="en">Example SKI TSA</Name>
+                        </ServiceName>
+                        <ServiceDigitalIdentity>
+                            <DigitalId>
+                                <X509SKI>AQIDBAUGBwgJCgsMDQ4PEBESExQ=</X509SKI>
+                            </DigitalId>
+                        </ServiceDigitalIdentity>
+                        <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted</ServiceStatus>
+                        <StatusStartingTime>2020-03-01T00:00:00Z</StatusStartingTime>
+                    </ServiceInformation>
+                </TSPService>
+            </TSPServices>
+        </TrustServiceProvider>
+    </TrustServiceProviderList>
+    <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="sig-placeholder">
+        <ds:SignatureValue>bm90IGEgcmVhbCBzaWduYXR1cmU=</ds:SignatureValue>
+    </ds:Signature>
+</TrustServiceStatusList>
