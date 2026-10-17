@@ -426,7 +426,7 @@ type Checkpoint struct {
 
 // Verify runs every check and returns the report. checkpoints may be nil.
 func (v *Verifier) Verify(ctx context.Context, src Source, checkpoints map[string]Checkpoint) *Report {
-	r := &Report{StartedAt: v.now().UTC(), Streams: map[string]StreamReport{}}
+	r := &Report{StartedAt: v.now().UTC(), Streams: map[string]StreamReport{}, Full: len(checkpoints) == 0}
 	seals, drops := v.verifySeals(ctx, src, r)
 	v.verifyStreams(ctx, src, r, seals, drops, checkpoints)
 	r.FinishedAt = v.now().UTC()
