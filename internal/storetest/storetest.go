@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -511,6 +512,12 @@ func testSeals(t *testing.T, p Provider) {
 	if err := p.PutProof(c, seal.Proof{SealSeq: 9, Provider: "rfc3161", ObtainedAt: now, Bytes: []byte("tok")}); err == nil {
 		t.Fatal("proof for unknown seal accepted")
 	}
+	if err := p.PutProof(c, seal.Proof{SealSeq: 2, Provider: "rfc3161", ObtainedAt: now.Add(time.Second), Bytes: []byte("other")}); err == nil {
+		t.Fatal("second proof from the same provider accepted")
+	}
+	if err := p.PutProof(c, seal.Proof{SealSeq: 2, Provider: "ots", ObtainedAt: now, Bytes: []byte("o")}); err != nil {
+		t.Fatal(err)
+	}
 	un, err = p.Unanchored(c, "rfc3161", 10)
 	if err != nil || len(un) != 2 || un[0].Seq != 1 || un[1].Seq != 3 {
 		t.Fatalf("Unanchored after proof = %+v, %v", un, err)
@@ -520,8 +527,12 @@ func testSeals(t *testing.T, p Provider) {
 		t.Fatalf("Unanchored limit 1 = %d, %v", len(un), err)
 	}
 	proofs, err := p.Proofs(c, 2)
-	if err != nil || len(proofs) != 1 || proofs[0].Provider != "rfc3161" || string(proofs[0].Bytes) != "tok" || !proofs[0].ObtainedAt.Equal(now) {
+	if err != nil || len(proofs) != 2 {
 		t.Fatalf("Proofs(2) = %+v, %v", proofs, err)
+	}
+	sort.Slice(proofs, func(i, j int) bool { return proofs[i].Provider < proofs[j].Provider })
+	if proofs[0].Provider != "ots" || proofs[1].Provider != "rfc3161" || string(proofs[1].Bytes) != "tok" || !proofs[1].ObtainedAt.Equal(now) {
+		t.Fatalf("Proofs(2) = %+v", proofs)
 	}
 	if proofs, err := p.Proofs(c, 1); err != nil || len(proofs) != 0 {
 		t.Fatalf("Proofs(1) = %+v, %v", proofs, err)

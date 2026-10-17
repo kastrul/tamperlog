@@ -46,12 +46,14 @@ CREATE TABLE IF NOT EXISTS __SCHEMA__.tamperlog_seal (
   body      bytea       NOT NULL
 );
 
+-- One proof per seal and provider: sink keys have the same shape, and a
+-- second proof would be unreachable there.
 CREATE TABLE IF NOT EXISTS __SCHEMA__.tamperlog_proof (
   seal_seq    bigint      NOT NULL REFERENCES __SCHEMA__.tamperlog_seal (seq),
   provider    text        NOT NULL CHECK (provider ~ '^[a-z0-9][a-z0-9._-]*$' AND octet_length(provider) <= 63),
   obtained_at timestamptz NOT NULL,
   body        bytea       NOT NULL,
-  PRIMARY KEY (seal_seq, provider, obtained_at)
+  PRIMARY KEY (seal_seq, provider)
 );
 
 -- Refuses UPDATE, DELETE and TRUNCATE on every tamperlog table, for every
@@ -65,19 +67,59 @@ BEGIN
 END
 $$;
 
--- Checks the shape of a new link against the stream head under the same
--- advisory lock the Go appender takes (re-entrant within a transaction):
--- dense sequence, prev_hash equals the head's hash (or all zero bytes for
--- seq 1), at within 5 seconds of the database clock and not more than one
--- second before the head, and the same encoder and hasher as the head. Go computes the hash; the database checks what Go
--- asserts, so a client holding only INSERT cannot backdate or poison a stream.
+-- lp(b): 4-byte big-endian length followed by the bytes (SPEC.md section 1).
+CREATE OR REPLACE FUNCTION __SCHEMA__.tamperlog_lp(b bytea) RETURNS bytea
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+RETURN int4send(octet_length(b)) || b;
+
+-- The binary/v1 canonical form of a row, byte for byte as the Go encoder
+-- produces it. Attributes are emitted in byte-wise key order.
+CREATE OR REPLACE FUNCTION __SCHEMA__.tamperlog_canonical_binary_v1(e __SCHEMA__.tamperlog_event) RETURNS bytea
+LANGUAGE sql STABLE PARALLEL SAFE
+RETURN
+  __SCHEMA__.tamperlog_lp(convert_to(e.stream, 'UTF8'))
+  || int8send(e.seq)
+  || int8send((extract(epoch FROM e.at) * 1000000)::bigint)
+  || __SCHEMA__.tamperlog_lp(convert_to(e.actor, 'UTF8'))
+  || __SCHEMA__.tamperlog_lp(convert_to(e.subject, 'UTF8'))
+  || __SCHEMA__.tamperlog_lp(convert_to(e.action, 'UTF8'))
+  || __SCHEMA__.tamperlog_lp(convert_to(e.entity, 'UTF8'))
+  || __SCHEMA__.tamperlog_lp(convert_to(e.entity_id, 'UTF8'))
+  || __SCHEMA__.tamperlog_lp(coalesce(e.payload_hash, ''::bytea))
+  || int8send((SELECT count(*) FROM jsonb_each_text(e.attributes)))
+  || coalesce((
+       SELECT string_agg(__SCHEMA__.tamperlog_lp(convert_to(a.key, 'UTF8')) || __SCHEMA__.tamperlog_lp(convert_to(a.value, 'UTF8')), ''::bytea
+                         ORDER BY convert_to(a.key, 'UTF8'))
+       FROM jsonb_each_text(e.attributes) AS a), ''::bytea);
+
+-- The link hash of a binary/v1 + sha256 row (SPEC.md section 1.4).
+CREATE OR REPLACE FUNCTION __SCHEMA__.tamperlog_link_binary_v1_sha256(e __SCHEMA__.tamperlog_event) RETURNS bytea
+LANGUAGE sql STABLE PARALLEL SAFE
+RETURN sha256(
+  convert_to('tamperlog/v1', 'UTF8')
+  || __SCHEMA__.tamperlog_lp(convert_to('binary/v1', 'UTF8'))
+  || __SCHEMA__.tamperlog_lp(convert_to('sha256', 'UTF8'))
+  || e.prev_hash
+  || __SCHEMA__.tamperlog_canonical_binary_v1(e));
+
+-- Checks a new link against the stream head under the same advisory lock the
+-- Go appender takes (re-entrant within a transaction): dense sequence,
+-- prev_hash equals the head's hash (or all zero bytes for seq 1), at within
+-- 5 seconds of the database clock (read after the lock) and not more than one
+-- second before the head, the same encoder and hasher as the head, string
+-- attribute values, and, for the default binary/v1 + sha256 pair, the hash
+-- itself recomputed. Other encoder and hasher pairs get the shape checks only,
+-- since the database cannot compute SHA-3 or SHA-512/256 without extensions;
+-- a wrong hash from an INSERT-only client then stays detectable by the
+-- verifier but is not refused.
 CREATE OR REPLACE FUNCTION __SCHEMA__.tamperlog_check_link() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
   head   record;
-  now_ts timestamptz := clock_timestamp();
+  now_ts timestamptz;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('tamperlog:' || NEW.stream, 0));
+  now_ts := clock_timestamp();
 
   SELECT e.seq, e.hash, e.at, e.encoder, e.hasher INTO head
   FROM __SCHEMA__.tamperlog_event AS e
@@ -115,6 +157,17 @@ BEGIN
 
   IF NEW.at < now_ts - interval '5 seconds' OR NEW.at > now_ts + interval '5 seconds' THEN
     RAISE EXCEPTION 'tamperlog: %/%: at is not the database clock', NEW.stream, NEW.seq
+      USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+
+  IF EXISTS (SELECT FROM jsonb_each(NEW.attributes) AS a WHERE jsonb_typeof(a.value) <> 'string') THEN
+    RAISE EXCEPTION 'tamperlog: %/%: attribute values must be strings', NEW.stream, NEW.seq
+      USING ERRCODE = 'integrity_constraint_violation';
+  END IF;
+
+  IF NEW.encoder = 'binary/v1' AND NEW.hasher = 'sha256'
+     AND NEW.hash <> __SCHEMA__.tamperlog_link_binary_v1_sha256(NEW) THEN
+    RAISE EXCEPTION 'tamperlog: %/%: hash does not match the row', NEW.stream, NEW.seq
       USING ERRCODE = 'integrity_constraint_violation';
   END IF;
 

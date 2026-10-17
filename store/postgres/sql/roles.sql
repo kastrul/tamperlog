@@ -25,6 +25,9 @@ ALTER TABLE __SCHEMA__.tamperlog_schema       OWNER TO tamperlog_owner;
 ALTER FUNCTION __SCHEMA__.tamperlog_refuse_change() OWNER TO tamperlog_owner;
 ALTER FUNCTION __SCHEMA__.tamperlog_check_link()    OWNER TO tamperlog_owner;
 ALTER FUNCTION __SCHEMA__.tamperlog_check_seal()    OWNER TO tamperlog_owner;
+ALTER FUNCTION __SCHEMA__.tamperlog_lp(bytea)       OWNER TO tamperlog_owner;
+ALTER FUNCTION __SCHEMA__.tamperlog_canonical_binary_v1(__SCHEMA__.tamperlog_event) OWNER TO tamperlog_owner;
+ALTER FUNCTION __SCHEMA__.tamperlog_link_binary_v1_sha256(__SCHEMA__.tamperlog_event) OWNER TO tamperlog_owner;
 
 REVOKE ALL ON __SCHEMA__.tamperlog_event, __SCHEMA__.tamperlog_stream_head,
               __SCHEMA__.tamperlog_seal, __SCHEMA__.tamperlog_proof,

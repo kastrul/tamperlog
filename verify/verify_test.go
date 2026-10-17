@@ -198,6 +198,9 @@ func TestDetectsTampering(t *testing.T) {
 		}, verify.CodeStreamTruncated, "audit"},
 		"middle deleted without drop event": {func(_ *testing.T, f *fixture) {
 			f.store.Drop("audit", 2, 2)
+		}, verify.CodeChainInnerGap, "audit"},
+		"start deleted without drop event": {func(_ *testing.T, f *fixture) {
+			f.store.Drop("audit", 1, 1)
 		}, verify.CodeChainGap, "audit"},
 		"stream deleted": {func(_ *testing.T, f *fixture) {
 			f.store.Replace("auth", nil)
@@ -276,13 +279,21 @@ func TestSignatureVerifierRequiresSignatures(t *testing.T) {
 	signer, _ := sign.NewEd25519("k", priv)
 	f.writer = seal.NewWriter(f.store, seal.WithClock(f.clock), seal.WithSinks(f.sink), seal.WithSigner(signer))
 	f.seal(t) // signed
-	v := f.verifier(verify.WithSignatureVerifier(sign.NewEd25519Verifier(map[string]ed25519.PublicKey{"k": pub})))
+	sv, err := sign.NewEd25519Verifier(map[string]ed25519.PublicKey{"k": pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := f.verifier(verify.WithSignatureVerifier(sv))
 	rep := v.Verify(ctx, verify.FromProvider(f.store), nil)
 	errs := codes(rep, verify.Error)
 	if errs[verify.CodeSealUnsigned] != 1 || errs[verify.CodeSealSignature] != 0 {
 		t.Fatalf("%v", rep.Errors())
 	}
-	wrong := f.verifier(verify.WithSignatureVerifier(sign.NewEd25519Verifier(map[string]ed25519.PublicKey{"k": make([]byte, 32)})))
+	wrongKey, _ := sign.NewEd25519Verifier(map[string]ed25519.PublicKey{"k": make([]byte, 32)})
+	wrong := f.verifier(verify.WithSignatureVerifier(wrongKey))
+	if _, err := sign.NewEd25519Verifier(map[string]ed25519.PublicKey{"k": []byte{1}}); err == nil {
+		t.Fatal("short public key accepted")
+	}
 	if codes(wrong.Verify(ctx, verify.FromProvider(f.store), nil), verify.Error)[verify.CodeSealSignature] != 1 {
 		t.Fatal("wrong key accepted")
 	}
@@ -296,7 +307,7 @@ func TestRunnerRecordsOutcomeAndCheckpoints(t *testing.T) {
 	f.seal(t)
 	f.anchorAll(t)
 	var reports int
-	r := verify.NewRunner(f.verifier(), verify.FromProvider(f.store), verify.WithLog(f.log), verify.WithIncremental(),
+	r := verify.NewRunner(f.verifier(), verify.FromProvider(f.store), verify.WithLog(f.log), verify.WithIncremental(time.Hour),
 		verify.WithOnReport(func(context.Context, *verify.Report) { reports++ }))
 	rep := r.Once(ctx)
 	if !rep.OK() {
@@ -355,10 +366,96 @@ func TestMultipleConsecutiveDropsBridge(t *testing.T) {
 	if len(g) != 1 || !g[0].Bridged || g[0].First != 1 || g[0].Last != 7 {
 		t.Fatalf("gaps = %+v", g)
 	}
-	// A drop event whose digest was never sealed is a warning, not an error.
+	// A drop event whose digest was never sealed leaves the gap pending: a
+	// warning, not bridged, not an error.
 	f.drop(t, "audit", 8, 8)
 	rep = f.verifier().Verify(context.Background(), verify.FromProvider(f.store), nil)
-	if !rep.OK() || codes(rep, verify.Warning)[verify.CodeChainDrop] != 1 {
+	if !rep.OK() || codes(rep, verify.Warning)[verify.CodeChainDrop] != 1 || codes(rep, verify.Warning)[verify.CodeChainGapPending] != 1 || rep.Streams["audit"].Gaps[0].Bridged {
+		t.Fatalf("%v %+v", rep.Findings, rep.Streams["audit"].Gaps)
+	}
+	f.seal(t)
+	rep = f.verifier().Verify(context.Background(), verify.FromProvider(f.store), nil)
+	if !rep.OK() || !rep.Streams["audit"].Gaps[0].Bridged {
+		t.Fatalf("%v", rep.Findings)
+	}
+}
+
+func TestInnerGapsAreErrorsEvenWhenSealed(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.append(t, "audit", 6)
+	f.seal(t)
+	f.drop(t, "audit", 3, 4) // a DBA deletes and records a drop
+	f.seal(t)                // the writer seals it blindly
+	f.anchorAll(t)
+	rep := f.verifier().Verify(context.Background(), verify.FromProvider(f.store), nil)
+	if rep.OK() || codes(rep, verify.Error)[verify.CodeChainInnerGap] != 1 {
+		t.Fatalf("%v", rep.Findings)
+	}
+	rep = f.verifier(verify.WithAllowInnerGaps()).Verify(context.Background(), verify.FromProvider(f.store), nil)
+	if !rep.OK() {
+		t.Fatalf("%v", rep.Errors())
+	}
+}
+
+func TestSinkInventoryRevealsRollback(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	f.append(t, "audit", 2)
+	f.seal(t)
+	f.append(t, "audit", 2)
+	f.seal(t)
+	f.seal(t)
+	// A DBA restores the database to the state after seal 1; the sink keeps
+	// seals 2 and 3.
+	restored := memory.New(memory.WithClock(f.clock))
+	rlog := tamperlog.NewLog(restored)
+	for _, r := range f.store.Records("audit")[:2] {
+		if _, err := rlog.Append(ctx, r.Event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s1, _, _ := f.store.LastSeal(ctx)
+	seals, _ := f.store.Seals(ctx, 1, 1)
+	_ = s1
+	if err := restored.PutSeal(ctx, seals[0]); err != nil {
+		t.Fatal(err)
+	}
+	rep := verify.New(verify.WithSinks(f.sink), verify.WithClock(f.clock)).Verify(ctx, verify.FromProvider(restored), nil)
+	if rep.OK() || codes(rep, verify.Error)[verify.CodeSinkExtra] != 1 {
+		t.Fatalf("%v", rep.Findings)
+	}
+	// Even with every seal gone from the store, the sink inventory speaks.
+	empty := memory.New()
+	rep = verify.New(verify.WithSinks(f.sink)).Verify(ctx, verify.FromProvider(empty), nil)
+	if rep.OK() || codes(rep, verify.Error)[verify.CodeSinkExtra] != 1 {
+		t.Fatalf("%v", rep.Findings)
+	}
+}
+
+func TestFreshnessPolicies(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFixture(t)
+	f.append(t, "audit", 1)
+	f.seal(t)
+	f.now = f.now.Add(3 * time.Hour)
+	f.seal(t)
+	f.anchorAll(t)
+	rep := f.verifier(verify.WithMaxSealInterval(2*time.Hour)).Verify(ctx, verify.FromProvider(f.store), nil)
+	if codes(rep, verify.Error)[verify.CodeSealInterval] != 1 {
+		t.Fatalf("%v", rep.Findings)
+	}
+	f.now = f.now.Add(48 * time.Hour)
+	rep = f.verifier(verify.WithMaxSealAge(24*time.Hour)).Verify(ctx, verify.FromProvider(f.store), nil)
+	if codes(rep, verify.Error)[verify.CodeSealStale] != 1 {
+		t.Fatalf("%v", rep.Findings)
+	}
+	// A seal dated in the future is refused.
+	f.now = f.now.Add(-100 * time.Hour)
+	rep = f.verifier().Verify(ctx, verify.FromProvider(f.store), nil)
+	if codes(rep, verify.Error)[verify.CodeSealFuture] == 0 {
 		t.Fatalf("%v", rep.Findings)
 	}
 }

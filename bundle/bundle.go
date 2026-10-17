@@ -177,8 +177,15 @@ func Export(ctx context.Context, src verify.Source, dir string, opts ExportOptio
 	if err != nil {
 		return nil, err
 	}
-	for lo := int64(1); ; lo += opts.PageSize {
-		seals, err := src.Seals(ctx, lo, lo+opts.PageSize-1)
+	last, hasSeals, err := src.LastSeal(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("bundle: last seal: %w", err)
+	}
+	if !hasSeals {
+		last.Seq = 0
+	}
+	for lo := int64(1); lo <= last.Seq; lo += opts.PageSize {
+		seals, err := src.Seals(ctx, lo, min(lo+opts.PageSize-1, last.Seq))
 		if err != nil {
 			return nil, fmt.Errorf("bundle: seals: %w", err)
 		}
@@ -196,14 +203,11 @@ func Export(ctx context.Context, src verify.Source, dir string, opts ExportOptio
 				return nil, fmt.Errorf("bundle: proofs of seal %d: %w", s.Seq, err)
 			}
 			for _, p := range proofs {
-				if err := sink.Put(ctx, seal.ProofKey(s.Seq, p.Provider), p.Bytes); err != nil && !errors.Is(err, seal.ErrExists) {
+				if err := sink.Put(ctx, seal.ProofKey(s.Seq, p.Provider), p.Bytes); err != nil {
 					return nil, err
 				}
 				m.Proofs[p.Provider]++
 			}
-		}
-		if int64(len(seals)) < opts.PageSize {
-			break
 		}
 	}
 	b, err := json.MarshalIndent(m, "", "  ")

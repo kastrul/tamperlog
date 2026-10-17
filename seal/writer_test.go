@@ -133,7 +133,10 @@ func TestWriterSignsAndResyncs(t *testing.T) {
 	if parsed.KeyID != "k2026" || len(parsed.Signature) != ed25519.SignatureSize {
 		t.Fatalf("seal = %+v", parsed)
 	}
-	v := sign.NewEd25519Verifier(map[string]ed25519.PublicKey{"k2026": pub})
+	v, err := sign.NewEd25519Verifier(map[string]ed25519.PublicKey{"k2026": pub})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := sign.VerifySeal(ctx, v, parsed); err != nil {
 		t.Fatal(err)
 	}

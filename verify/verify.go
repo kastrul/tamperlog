@@ -176,6 +176,13 @@ const (
 	CodeNoSeals          = "no_seals"
 	CodeSourceError      = "source_error"
 	CodeStreamNotSealed  = "stream_not_sealed"
+	CodeSinkExtra        = "sink_extra_seal"
+	CodeSealStale        = "seal_stale"
+	CodeSealInterval     = "seal_interval"
+	CodeSealFuture       = "seal_future"
+	CodeProofDelay       = "proof_delay"
+	CodeChainGapPending  = "chain_gap_pending"
+	CodeChainInnerGap    = "chain_inner_gap"
 )
 
 // StreamReport summarises one stream.
@@ -215,6 +222,7 @@ type SealReport struct {
 type Report struct {
 	StartedAt  time.Time               `json:"started_at"`
 	FinishedAt time.Time               `json:"finished_at"`
+	Full       bool                    `json:"full"` // every record re-linked (no checkpoints used)
 	Seals      SealReport              `json:"seals"`
 	Streams    map[string]StreamReport `json:"streams"`
 	Findings   []Finding               `json:"findings"`
@@ -338,6 +346,32 @@ func WithLogger(l *slog.Logger) Option { return func(v *Verifier) { v.logger = l
 // non-qualified authorities as a warning instead of info.
 func WithRequireQualified() Option { return func(v *Verifier) { v.requireQualified = true } }
 
+// WithMaxSealAge makes a latest seal older than d an error: the writer has
+// stopped, or the source was rolled back to an old but authentic state. Zero
+// (default) disables the check; set it to a few seal intervals.
+func WithMaxSealAge(d time.Duration) Option { return func(v *Verifier) { v.maxSealAge = d } }
+
+// WithMaxSealInterval makes a gap longer than d between consecutive seals an
+// error. Zero (default) disables the check.
+func WithMaxSealInterval(d time.Duration) Option { return func(v *Verifier) { v.maxSealInterval = d } }
+
+// WithFutureSkew sets how far a seal time may lie in the future (default 5
+// minutes); beyond it the seal is an error.
+func WithFutureSkew(d time.Duration) Option { return func(v *Verifier) { v.futureSkew = d } }
+
+// WithMaxAnchorDelay reports a proof attested more than d after the seal time
+// as a warning (default 24 h): a proof bounds when the seal existed by, not
+// when it claims to have been written. Zero disables the check.
+func WithMaxAnchorDelay(d time.Duration) Option { return func(v *Verifier) { v.maxAnchorDelay = d } }
+
+// WithAllowInnerGaps accepts sealed drops inside a stream, not only at its
+// start. By default a legitimate retention drop removes the oldest records,
+// so a gap must begin at sequence 1; an inner gap is an error even with a
+// sealed drop event, which stops anyone who can append to the system stream
+// from legitimising a deletion in the middle of history. Enable this only
+// for storage layouts that drop inner ranges (legacy partitions).
+func WithAllowInnerGaps() Option { return func(v *Verifier) { v.allowInnerGaps = true } }
+
 // Verifier runs the checks. It holds no state between runs except what is
 // passed through [Checkpoint]s.
 type Verifier struct {
@@ -353,20 +387,27 @@ type Verifier struct {
 	now              func() time.Time
 	logger           *slog.Logger
 	requireQualified bool
+	maxSealAge       time.Duration
+	maxSealInterval  time.Duration
+	futureSkew       time.Duration
+	maxAnchorDelay   time.Duration
+	allowInnerGaps   bool
 }
 
 // New returns a Verifier.
 func New(opts ...Option) *Verifier {
 	v := &Verifier{
-		anchors:      map[string]anchor.Provider{},
-		encoders:     map[string]tamperlog.Encoder{tamperlog.BinaryV1.ID(): tamperlog.BinaryV1, jcs.V1.ID(): jcs.V1},
-		timeTol:      tamperlog.DefaultTimeTolerance,
-		anchorGrace:  4 * time.Hour,
-		anchorSkew:   time.Minute,
-		systemStream: tamperlog.SystemStream,
-		page:         1000,
-		now:          time.Now,
-		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		anchors:        map[string]anchor.Provider{},
+		encoders:       map[string]tamperlog.Encoder{tamperlog.BinaryV1.ID(): tamperlog.BinaryV1, jcs.V1.ID(): jcs.V1},
+		timeTol:        tamperlog.DefaultTimeTolerance,
+		anchorGrace:    4 * time.Hour,
+		anchorSkew:     time.Minute,
+		systemStream:   tamperlog.SystemStream,
+		page:           1000,
+		now:            time.Now,
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		futureSkew:     5 * time.Minute,
+		maxAnchorDelay: 24 * time.Hour,
 	}
 	for _, o := range opts {
 		o(v)
@@ -416,22 +457,30 @@ type parsedSeal struct {
 func (v *Verifier) verifySeals(ctx context.Context, src Source, r *Report) ([]parsedSeal, map[string]int64) {
 	drops := map[string]int64{} // hex digest -> seal seq that lists it
 	var seals []parsedSeal
-	for lo := int64(1); ; lo += v.page {
-		batch, err := src.Seals(ctx, lo, lo+v.page-1)
-		if err != nil {
-			r.add(Finding{Severity: Error, Layer: LayerSeal, Code: CodeSourceError, Message: "reading seals: " + err.Error()})
-			return seals, drops
-		}
-		for _, st := range batch {
-			seals = append(seals, parsedSeal{Stored: st})
-		}
-		if int64(len(batch)) < v.page {
-			break
+	last, hasLast, err := src.LastSeal(ctx)
+	if err != nil {
+		r.add(Finding{Severity: Error, Layer: LayerSeal, Code: CodeSourceError, Message: "reading last seal: " + err.Error()})
+		return seals, drops
+	}
+	if hasLast {
+		for lo := int64(1); lo <= last.Seq; lo += v.page {
+			batch, err := src.Seals(ctx, lo, min(lo+v.page-1, last.Seq))
+			if err != nil {
+				r.add(Finding{Severity: Error, Layer: LayerSeal, Code: CodeSourceError, Message: "reading seals: " + err.Error()})
+				return seals, drops
+			}
+			for _, st := range batch {
+				seals = append(seals, parsedSeal{Stored: st})
+			}
 		}
 	}
+	v.reconcileSinks(ctx, r, seals)
 	if len(seals) == 0 {
 		r.add(Finding{Severity: Warning, Layer: LayerSeal, Code: CodeNoSeals, Message: "no seals exist; the chain is only checked for internal consistency"})
 		return nil, drops
+	}
+	if v.maxSealAge > 0 && v.now().Sub(last.SealedAt) > v.maxSealAge {
+		r.add(Finding{Severity: Error, Layer: LayerSeal, Code: CodeSealStale, SealSeq: last.Seq, Message: fmt.Sprintf("latest seal is %s old, limit %s: the writer stopped or the source was rolled back", v.now().Sub(last.SealedAt).Round(time.Minute), v.maxSealAge)})
 	}
 	r.Seals.Count = int64(len(seals))
 	r.Seals.FirstSeq = seals[0].Seq
@@ -469,6 +518,12 @@ func (v *Verifier) verifySeals(ctx context.Context, src Source, r *Report) ([]pa
 		if prev != nil && prev.doc != nil && !doc.SealedAt.After(prev.doc.SealedAt) {
 			r.add(Finding{Severity: Error, Layer: LayerSeal, Code: CodeSealTime, SealSeq: s.Seq, Message: fmt.Sprintf("sealed_at %s is not after seal %d at %s", doc.SealedAt.Format(time.RFC3339Nano), prev.Seq, prev.doc.SealedAt.Format(time.RFC3339Nano))})
 		}
+		if prev != nil && prev.doc != nil && v.maxSealInterval > 0 && doc.SealedAt.Sub(prev.doc.SealedAt) > v.maxSealInterval {
+			r.add(Finding{Severity: Error, Layer: LayerSeal, Code: CodeSealInterval, SealSeq: s.Seq, Message: fmt.Sprintf("%s passed between seal %d and seal %d, limit %s", doc.SealedAt.Sub(prev.doc.SealedAt).Round(time.Second), prev.Seq, s.Seq, v.maxSealInterval)})
+		}
+		if v.futureSkew > 0 && doc.SealedAt.After(v.now().Add(v.futureSkew)) {
+			r.add(Finding{Severity: Error, Layer: LayerSeal, Code: CodeSealFuture, SealSeq: s.Seq, Message: fmt.Sprintf("sealed_at %s is in the future", doc.SealedAt.Format(time.RFC3339))})
+		}
 		if !doc.SealedAt.Equal(s.SealedAt) {
 			r.add(Finding{Severity: Error, Layer: LayerSeal, Code: CodeSealTime, SealSeq: s.Seq, Message: "stored sealed_at differs from the document"})
 		}
@@ -501,6 +556,69 @@ func (v *Verifier) verifySeals(ctx context.Context, src Source, r *Report) ([]pa
 		r.Seals.LastAt = last.doc.SealedAt
 	}
 	return seals, drops
+}
+
+// reconcileSinks lists every sink's seal keys and reports seals a sink holds
+// beyond the source's last seal: the source was rolled back, or a sink
+// received seals the database never had. Either way the sink's copy is read
+// and checked to continue the chain from the source's last seal, so the
+// report can say how far the rollback goes.
+func (v *Verifier) reconcileSinks(ctx context.Context, r *Report, seals []parsedSeal) {
+	if len(v.sinks) == 0 {
+		return
+	}
+	var lastSeq int64
+	var lastHash []byte
+	if n := len(seals); n > 0 {
+		lastSeq, lastHash = seals[n-1].Seq, seals[n-1].Hash
+	}
+	for _, sink := range v.sinks {
+		name := fmt.Sprintf("%T", sink)
+		keys, err := sink.List(ctx, "seals/")
+		if err != nil {
+			r.add(Finding{Severity: Error, Layer: LayerSink, Code: CodeSinkError, Message: fmt.Sprintf("%s: list: %v", name, err)})
+			continue
+		}
+		var extra []int64
+		for _, k := range keys {
+			var seq int64
+			if _, err := fmt.Sscanf(k, "seals/%d.json", &seq); err != nil || !strings.HasSuffix(k, ".json") {
+				continue
+			}
+			if seq > lastSeq {
+				extra = append(extra, seq)
+			}
+		}
+		if len(extra) == 0 {
+			continue
+		}
+		slices.Sort(extra)
+		prevHash := lastHash
+		if lastSeq == 0 {
+			prevHash = seal.GenesisHash
+		}
+		linked := 0
+		for i, seq := range extra {
+			if seq != lastSeq+int64(i)+1 {
+				break
+			}
+			data, err := sink.Get(ctx, seal.Key(seq))
+			if err != nil {
+				break
+			}
+			doc, err := seal.Parse(data)
+			if err != nil || doc.Seq != seq || !bytes.Equal(doc.PrevSealHash, prevHash) {
+				break
+			}
+			prevHash = seal.Hash(data)
+			linked++
+		}
+		msg := fmt.Sprintf("%s holds %d seal(s) beyond the source's last seal %d (%d..%d)", name, len(extra), lastSeq, extra[0], extra[len(extra)-1])
+		if linked > 0 {
+			msg += fmt.Sprintf("; %d of them continue the source's seal chain, so the source was rolled back to seal %d", linked, lastSeq)
+		}
+		r.add(Finding{Severity: Error, Layer: LayerSink, Code: CodeSinkExtra, SealSeq: extra[0], Message: msg})
+	}
 }
 
 func (v *Verifier) verifySignature(ctx context.Context, r *Report, s *parsedSeal) {
@@ -541,6 +659,9 @@ func (v *Verifier) verifyProofs(ctx context.Context, src Source, r *Report, s *p
 		if att.Time.Before(s.SealedAt.Add(-v.anchorSkew)) {
 			r.add(Finding{Severity: Error, Layer: LayerAnchor, Code: CodeProofTime, SealSeq: s.Seq, Message: fmt.Sprintf("%s attests %s, before the seal time %s", p.Provider, att.Time.Format(time.RFC3339), s.SealedAt.Format(time.RFC3339))})
 			continue
+		}
+		if v.maxAnchorDelay > 0 && att.Time.After(s.SealedAt.Add(v.maxAnchorDelay)) {
+			r.add(Finding{Severity: Warning, Layer: LayerAnchor, Code: CodeProofDelay, SealSeq: s.Seq, Message: fmt.Sprintf("%s attests %s, %s after the seal time; the proof bounds existence by then, not the seal time itself", p.Provider, att.Time.Format(time.RFC3339), att.Time.Sub(s.SealedAt).Round(time.Minute))})
 		}
 		valid++
 		if att.Qualified {
@@ -638,11 +759,18 @@ func (v *Verifier) verifyStreams(ctx context.Context, src Source, r *Report, sea
 	}
 }
 
-// loadDrops reads every drop event in the system stream and checks each
-// against the sealed digests. Unsealed drops are accepted for bridging with
-// a warning: they are newer than the last seal.
-func (v *Verifier) loadDrops(ctx context.Context, src Source, r *Report, heads map[string]tamperlog.Head, firsts map[string]int64, sealedDrops map[string]int64) map[string][]tamperlog.Drop {
-	out := map[string][]tamperlog.Drop{}
+// drop is a parsed drop event and whether a seal lists its digest.
+type drop struct {
+	tamperlog.Drop
+	sealed bool
+}
+
+// loadDrops reads every drop event in the system stream and marks each as
+// sealed or pending. Only sealed drops authorise a gap; a pending drop (newer
+// than the last seal) leaves its gap unverified with a warning until the next
+// seal lists it.
+func (v *Verifier) loadDrops(ctx context.Context, src Source, r *Report, heads map[string]tamperlog.Head, firsts map[string]int64, sealedDrops map[string]int64) map[string][]drop {
+	out := map[string][]drop{}
 	h, ok := heads[v.systemStream]
 	if !ok {
 		return out
@@ -666,17 +794,18 @@ func (v *Verifier) loadDrops(ctx context.Context, src Source, r *Report, heads m
 				r.add(Finding{Severity: Error, Layer: LayerChain, Code: CodeChainDrop, Stream: v.systemStream, Seq: rec.Seq, Message: err.Error()})
 				continue
 			}
-			if _, sealed := sealedDrops[hex.EncodeToString(d.Digest)]; !sealed {
+			_, sealed := sealedDrops[hex.EncodeToString(d.Digest)]
+			if !sealed {
 				r.add(Finding{Severity: Warning, Layer: LayerChain, Code: CodeChainDrop, Stream: d.Stream, Seq: rec.Seq, Message: fmt.Sprintf("drop of %d..%d is recorded but not yet sealed", d.FirstSeq, d.LastSeq)})
 			}
-			out[d.Stream] = append(out[d.Stream], d)
+			out[d.Stream] = append(out[d.Stream], drop{Drop: d, sealed: sealed})
 		}
 	}
 	return out
 }
 
 // verifyStream walks one stream.
-func (v *Verifier) verifyStream(ctx context.Context, src Source, r *Report, name string, head tamperlog.Head, first int64, sealed seal.StreamHead, sealedHeads map[int64][]byte, drops []tamperlog.Drop, cp Checkpoint) (sr StreamReport) {
+func (v *Verifier) verifyStream(ctx context.Context, src Source, r *Report, name string, head tamperlog.Head, first int64, sealed seal.StreamHead, sealedHeads map[int64][]byte, drops []drop, cp Checkpoint) (sr StreamReport) {
 	sr = StreamReport{Stream: name, Encoder: head.Encoder, Hasher: head.Hasher, FirstKeptSeq: first, HeadSeq: head.Seq, HeadHash: hex.EncodeToString(head.Hash), SealedHead: sealed.HeadSeq, Gaps: []Gap{}}
 	errs := len(r.Errors())
 	defer func() { sr.Verified = len(r.Errors()) == errs }()
@@ -798,6 +927,10 @@ func (v *Verifier) verifyStream(ctx context.Context, src Source, r *Report, name
 			fail(CodeChainHead, seq, "record sealed at this sequence number is missing")
 		case !bytes.Equal(recs[0].Hash, want):
 			fail(CodeChainHead, seq, "record hash differs from the hash sealed for this sequence number")
+		default:
+			if got, err := chain.Link(recs[0]); err != nil || !bytes.Equal(got, want) {
+				fail(CodeChainHead, seq, "record content no longer hashes to the sealed hash")
+			}
 		}
 	}
 	if prevRec == nil {
@@ -818,35 +951,41 @@ func ifDetail(d string) string {
 }
 
 // bridge checks that the gap first..last between before (nil at the start
-// of a stream) and after is covered by drop events whose edge hashes chain
-// from before's hash (or genesis) to after's prev_hash.
-func (v *Verifier) bridge(r *Report, sr *StreamReport, name string, chain tamperlog.Chain, before *tamperlog.Record, atGenesis bool, first, last int64, after *tamperlog.Record, drops []tamperlog.Drop) {
+// of a stream) and after is covered by sealed drop events whose edge hashes
+// chain from before's hash (or genesis) to after's prev_hash. Gaps not at the
+// start of the stream are errors unless WithAllowInnerGaps is set. Pending
+// (unsealed) drops leave the gap unverified with a warning.
+func (v *Verifier) bridge(r *Report, sr *StreamReport, name string, chain tamperlog.Chain, before *tamperlog.Record, atGenesis bool, first, last int64, after *tamperlog.Record, drops []drop) {
 	gap := Gap{First: first, Last: last}
 	defer func() { sr.Gaps = append(sr.Gaps, gap) }()
+	if !atGenesis && !v.allowInnerGaps {
+		r.add(Finding{Severity: Error, Layer: LayerChain, Code: CodeChainInnerGap, Stream: name, Seq: first, Message: fmt.Sprintf("records %d..%d are missing from the middle of the stream; retention only drops from the start", first, last)})
+		return
+	}
 	var running []byte
 	switch {
 	case before != nil:
 		running = before.Hash
-	case atGenesis:
-		running = chain.Genesis()
 	default:
-		// Gap at the start of what we read but not at seq 1: the records
-		// before first were dropped by drops whose last hash is after.PrevHash.
-		running = nil
+		running = chain.Genesis()
 	}
 	seq := first
+	pending := false
 	for seq <= last {
-		var found *tamperlog.Drop
+		var found *drop
 		for i := range drops {
 			d := &drops[i]
-			if d.FirstSeq == seq && (running == nil || bytes.Equal(d.FirstPrevHash, running)) {
+			if d.FirstSeq == seq && bytes.Equal(d.FirstPrevHash, running) {
 				found = d
 				break
 			}
 		}
 		if found == nil {
-			r.add(Finding{Severity: Error, Layer: LayerChain, Code: CodeChainGap, Stream: name, Seq: seq, Message: fmt.Sprintf("records %d..%d are missing and no sealed drop event starts at %d with the expected edge hash", seq, last, seq)})
+			r.add(Finding{Severity: Error, Layer: LayerChain, Code: CodeChainGap, Stream: name, Seq: seq, Message: fmt.Sprintf("records %d..%d are missing and no drop event starts at %d with the expected edge hash", seq, last, seq)})
 			return
+		}
+		if !found.sealed {
+			pending = true
 		}
 		running = found.LastHash
 		seq = found.LastSeq + 1
@@ -857,6 +996,10 @@ func (v *Verifier) bridge(r *Report, sr *StreamReport, name string, chain tamper
 	}
 	if !bytes.Equal(after.PrevHash, running) {
 		r.add(Finding{Severity: Error, Layer: LayerChain, Code: CodeChainGap, Stream: name, Seq: after.Seq, Message: fmt.Sprintf("record %d does not link to the last dropped record's hash", after.Seq)})
+		return
+	}
+	if pending {
+		r.add(Finding{Severity: Warning, Layer: LayerChain, Code: CodeChainGapPending, Stream: name, Seq: first, Message: fmt.Sprintf("gap %d..%d is bridged by drop events that no seal lists yet", first, last)})
 		return
 	}
 	gap.Bridged = true

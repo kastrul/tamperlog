@@ -29,26 +29,38 @@ func WithOnReport(fn func(ctx context.Context, rep *Report)) RunnerOption {
 }
 
 // WithIncremental keeps per-stream checkpoints between runs so each run
-// re-links only new records (seals and sealed heads are always checked in
-// full). A broken run resets the checkpoints so the next run walks
-// everything.
-func WithIncremental() RunnerOption { return func(r *Runner) { r.incremental = true } }
+// re-links only the records after the checkpoint. Every seal, every sealed
+// head (re-hashed) and the checkpoint record are still checked, but an edit of
+// a non-head record before the checkpoint that keeps its stored hash is not
+// seen until the next full walk; fullEvery (default 24 h) forces one. A
+// broken run also resets the checkpoints.
+func WithIncremental(fullEvery time.Duration) RunnerOption {
+	return func(r *Runner) {
+		r.incremental = true
+		if fullEvery > 0 {
+			r.fullEvery = fullEvery
+		}
+	}
+}
 
-// Runner verifies on an interval.
+// Runner verifies on an interval. Runs are serialised: a second Once waits
+// for the first.
 type Runner struct {
 	v           *Verifier
 	src         Source
 	log         *tamperlog.Log
 	onReport    func(ctx context.Context, rep *Report)
 	incremental bool
+	fullEvery   time.Duration
 
-	mu          sync.Mutex
+	mu          sync.Mutex // held for the whole of Once
 	checkpoints map[string]Checkpoint
+	lastFull    time.Time
 }
 
 // NewRunner returns a Runner verifying src with v.
 func NewRunner(v *Verifier, src Source, opts ...RunnerOption) *Runner {
-	r := &Runner{v: v, src: src, checkpoints: map[string]Checkpoint{}}
+	r := &Runner{v: v, src: src, checkpoints: map[string]Checkpoint{}, fullEvery: 24 * time.Hour}
 	for _, o := range opts {
 		o(r)
 	}
@@ -58,16 +70,24 @@ func NewRunner(v *Verifier, src Source, opts ...RunnerOption) *Runner {
 // Once verifies once, records the outcome and returns the report.
 func (r *Runner) Once(ctx context.Context) *Report {
 	r.mu.Lock()
-	cps := r.checkpoints
-	if !r.incremental {
-		cps = nil
+	defer r.mu.Unlock()
+	now := r.v.now()
+	var cps map[string]Checkpoint
+	full := !r.incremental || r.lastFull.IsZero() || now.Sub(r.lastFull) >= r.fullEvery
+	if !full {
+		cps = make(map[string]Checkpoint, len(r.checkpoints))
+		for k, v := range r.checkpoints {
+			cps[k] = Checkpoint{Seq: v.Seq, Hash: append([]byte(nil), v.Hash...)}
+		}
 	}
-	r.mu.Unlock()
 
 	rep := r.v.Verify(ctx, r.src, cps)
+	rep.Full = full
 
-	r.mu.Lock()
 	if rep.OK() && r.incremental {
+		if full {
+			r.lastFull = now
+		}
 		for name, s := range rep.Streams {
 			if s.VerifiedUpTo > 0 {
 				r.checkpoints[name] = Checkpoint{Seq: s.VerifiedUpTo, Hash: mustHex(s.HeadHash)}
@@ -75,8 +95,8 @@ func (r *Runner) Once(ctx context.Context) *Report {
 		}
 	} else {
 		r.checkpoints = map[string]Checkpoint{}
+		r.lastFull = time.Time{}
 	}
-	r.mu.Unlock()
 
 	if r.log != nil {
 		r.record(ctx, rep)

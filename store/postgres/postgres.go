@@ -109,15 +109,21 @@ type Store struct {
 	q   Querier
 	cfg Config
 	t   string // schema-qualified table prefix, e.g. "public.tamperlog_"
+	err error  // configuration error reported by every method
 }
 
 // NewStore binds the store logic to q, which must represent one open
-// transaction.
+// transaction. An invalid schema name (anything but a lowercase unquoted
+// identifier) makes every method fail, since the name is spliced into SQL.
 func NewStore(q Querier, cfg Config) *Store {
 	if cfg.Schema == "" {
 		cfg.Schema = "public"
 	}
-	return &Store{q: q, cfg: cfg, t: cfg.Schema + ".tamperlog_"}
+	s := &Store{q: q, cfg: cfg, t: cfg.Schema + ".tamperlog_"}
+	if !identRE.MatchString(cfg.Schema) {
+		s.err = fmt.Errorf("postgres: invalid schema name %q", cfg.Schema)
+	}
+	return s
 }
 
 // Head locks the stream and returns its last link and clock_timestamp().
@@ -126,6 +132,9 @@ func NewStore(q Querier, cfg Config) *Store {
 // lock holder's committed row. REPEATABLE READ or SERIALIZABLE transactions
 // would reuse an older snapshot and must not be used for appends.
 func (s *Store) Head(ctx context.Context, stream string) (tamperlog.Head, error) {
+	if s.err != nil {
+		return tamperlog.Head{}, s.err
+	}
 	if err := tamperlog.ValidateStream(stream); err != nil {
 		return tamperlog.Head{}, err
 	}
@@ -172,6 +181,9 @@ LEFT JOIN LATERAL (
 // Insert writes r. The BEFORE INSERT trigger rejects a record that does not
 // extend the head.
 func (s *Store) Insert(ctx context.Context, r tamperlog.Record) error {
+	if s.err != nil {
+		return s.err
+	}
 	attrs, err := json.Marshal(nonNil(r.Attributes))
 	if err != nil {
 		return fmt.Errorf("postgres: attributes: %w", err)
@@ -184,6 +196,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14)`,
 
 // Range reads records first..last of stream in order.
 func (s *Store) Range(ctx context.Context, stream string, first, last int64) ([]tamperlog.Record, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	rows, err := s.q.Query(ctx, `
 SELECT stream, seq, at, encoder, hasher, actor, subject, action, entity, entity_id, payload_hash, attributes, prev_hash, hash
 FROM `+s.t+`event WHERE stream = $1 AND seq BETWEEN $2 AND $3 ORDER BY seq`, stream, first, last)
@@ -227,6 +242,9 @@ func nonNil(m map[string]string) map[string]string {
 
 // Heads returns every non-empty stream's last link.
 func (s *Store) Heads(ctx context.Context) (map[string]tamperlog.Head, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	rows, err := s.q.Query(ctx, `SELECT DISTINCT ON (stream) stream, seq, hash, at, encoder, hasher FROM `+s.t+`event ORDER BY stream, seq DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: heads: %w", err)
@@ -250,6 +268,9 @@ func (s *Store) Heads(ctx context.Context) (map[string]tamperlog.Head, error) {
 
 // FirstSeqs returns every non-empty stream's smallest kept sequence number.
 func (s *Store) FirstSeqs(ctx context.Context) (map[string]int64, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	rows, err := s.q.Query(ctx, `SELECT stream, min(seq) FROM `+s.t+`event GROUP BY stream`)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: first seqs: %w", err)
@@ -272,11 +293,17 @@ func (s *Store) FirstSeqs(ctx context.Context) (map[string]int64, error) {
 
 // PutSeal stores a seal; the trigger enforces dense sequence numbers.
 func (s *Store) PutSeal(ctx context.Context, st seal.Stored) error {
+	if s.err != nil {
+		return s.err
+	}
 	return s.q.Exec(ctx, `INSERT INTO `+s.t+`seal (seq, sealed_at, hash, body) VALUES ($1, $2, $3, $4)`, st.Seq, st.SealedAt, st.Hash, st.Bytes)
 }
 
 // LastSeal returns the newest seal.
 func (s *Store) LastSeal(ctx context.Context) (seal.Stored, bool, error) {
+	if s.err != nil {
+		return seal.Stored{}, false, s.err
+	}
 	var st seal.Stored
 	var seq *int64
 	var sealedAt *time.Time
@@ -297,6 +324,9 @@ LEFT JOIN LATERAL (SELECT seq, sealed_at, hash, body FROM `+s.t+`seal ORDER BY s
 
 // Seals returns seals first..last.
 func (s *Store) Seals(ctx context.Context, first, last int64) ([]seal.Stored, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	rows, err := s.q.Query(ctx, `SELECT seq, sealed_at, hash, body FROM `+s.t+`seal WHERE seq BETWEEN $1 AND $2 ORDER BY seq`, first, last)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: seals: %w", err)
@@ -323,11 +353,17 @@ func scanSeals(rows Rows) ([]seal.Stored, error) {
 
 // PutProof stores p; the foreign key refuses an unknown seal.
 func (s *Store) PutProof(ctx context.Context, p seal.Proof) error {
+	if s.err != nil {
+		return s.err
+	}
 	return s.q.Exec(ctx, `INSERT INTO `+s.t+`proof (seal_seq, provider, obtained_at, body) VALUES ($1, $2, $3, $4)`, p.SealSeq, p.Provider, p.ObtainedAt, p.Bytes)
 }
 
 // Proofs returns the proofs of one seal.
 func (s *Store) Proofs(ctx context.Context, sealSeq int64) ([]seal.Proof, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	rows, err := s.q.Query(ctx, `SELECT seal_seq, provider, obtained_at, body FROM `+s.t+`proof WHERE seal_seq = $1 ORDER BY obtained_at`, sealSeq)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: proofs: %w", err)
@@ -350,6 +386,9 @@ func (s *Store) Proofs(ctx context.Context, sealSeq int64) ([]seal.Proof, error)
 
 // Unanchored returns up to limit seals without a proof from provider.
 func (s *Store) Unanchored(ctx context.Context, provider string, limit int) ([]seal.Stored, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	rows, err := s.q.Query(ctx, `
 SELECT s.seq, s.sealed_at, s.hash, s.body FROM `+s.t+`seal AS s
 WHERE NOT EXISTS (SELECT FROM `+s.t+`proof AS p WHERE p.seal_seq = s.seq AND p.provider = $1)

@@ -45,7 +45,7 @@ func NewEd25519(keyID string, priv ed25519.PrivateKey) (*Ed25519, error) {
 	if len(priv) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("sign: private key is %d bytes, want %d", len(priv), ed25519.PrivateKeySize)
 	}
-	return &Ed25519{keyID: keyID, priv: priv}, nil
+	return &Ed25519{keyID: keyID, priv: append(ed25519.PrivateKey(nil), priv...)}, nil
 }
 
 // KeyID returns the key identifier.
@@ -67,13 +67,20 @@ type Ed25519Verifier struct {
 	keys map[string]ed25519.PublicKey
 }
 
-// NewEd25519Verifier returns a verifier for the given keys.
-func NewEd25519Verifier(keys map[string]ed25519.PublicKey) *Ed25519Verifier {
+// NewEd25519Verifier returns a verifier for the given keys, which must all be
+// 32 bytes.
+func NewEd25519Verifier(keys map[string]ed25519.PublicKey) (*Ed25519Verifier, error) {
 	m := make(map[string]ed25519.PublicKey, len(keys))
 	for k, v := range keys {
-		m[k] = v
+		if k == "" {
+			return nil, errors.New("sign: empty key id")
+		}
+		if len(v) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("sign: public key %q is %d bytes, want %d", k, len(v), ed25519.PublicKeySize)
+		}
+		m[k] = append(ed25519.PublicKey(nil), v...)
 	}
-	return &Ed25519Verifier{keys: m}
+	return &Ed25519Verifier{keys: m}, nil
 }
 
 // Verify checks sig over data by keyID.

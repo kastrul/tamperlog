@@ -245,10 +245,43 @@ func (w *Writer) sink(ctx context.Context, key string, data []byte) {
 	}
 }
 
+// putOrCompare writes data under key, or, when the key exists, reads it back
+// and fails unless the bytes are identical: an existing object with other
+// content is evidence, never success.
+func putOrCompare(ctx context.Context, s Sink, key string, data []byte) (written bool, err error) {
+	err = s.Put(ctx, key, data)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, ErrExists) {
+		return false, err
+	}
+	have, gerr := s.Get(ctx, key)
+	if gerr != nil {
+		return false, fmt.Errorf("seal: %s exists but cannot be read: %w", key, gerr)
+	}
+	if !bytes.Equal(have, data) {
+		return false, fmt.Errorf("%w: %s holds different bytes", ErrConflict, key)
+	}
+	return false, nil
+}
+
+// ErrConflict is returned when a sink already holds different bytes under a
+// key the writer wanted to fill.
+var ErrConflict = errors.New("seal: sink object conflicts with the store")
+
+// PutOrCompare is [Sink.Put] that treats an existing identical object as
+// success and an existing different object as [ErrConflict].
+func PutOrCompare(ctx context.Context, s Sink, key string, data []byte) error {
+	_, err := putOrCompare(ctx, s, key, data)
+	return err
+}
+
 // Resync pushes to every sink each stored seal and proof whose key the sink
 // lacks, so a sink added later or one that was unreachable catches up. It
 // returns the number of objects written and the first error, after trying
-// every object.
+// every object. The last seal is read first and pages are walked up to it,
+// so a missing seal in the middle does not end the walk early.
 func (w *Writer) Resync(ctx context.Context) (int, error) {
 	var written int
 	var firstErr error
@@ -267,21 +300,26 @@ func (w *Writer) Resync(ctx context.Context) (int, error) {
 		for _, k := range have {
 			present[k] = true
 		}
+		last, ok, err := w.p.LastSeal(ctx)
+		if err != nil {
+			note(fmt.Errorf("seal: resync last seal: %w", err))
+			continue
+		}
+		if !ok {
+			continue
+		}
 		const page = 500
-		for lo := int64(1); ; lo += page {
-			seals, err := w.p.Seals(ctx, lo, lo+page-1)
+		for lo := int64(1); lo <= last.Seq; lo += page {
+			seals, err := w.p.Seals(ctx, lo, min(lo+page-1, last.Seq))
 			if err != nil {
 				note(fmt.Errorf("seal: resync seals: %w", err))
 				break
 			}
-			if len(seals) == 0 {
-				break
-			}
 			for _, st := range seals {
 				if !present[Key(st.Seq)] {
-					if err := s.Put(ctx, Key(st.Seq), st.Bytes); err != nil && !errors.Is(err, ErrExists) {
-						note(err)
-					} else {
+					did, err := putOrCompare(ctx, s, Key(st.Seq), st.Bytes)
+					note(err)
+					if did {
 						written++
 					}
 				}
@@ -295,9 +333,9 @@ func (w *Writer) Resync(ctx context.Context) (int, error) {
 					if present[k] {
 						continue
 					}
-					if err := s.Put(ctx, k, p.Bytes); err != nil && !errors.Is(err, ErrExists) {
-						note(err)
-					} else {
+					did, err := putOrCompare(ctx, s, k, p.Bytes)
+					note(err)
+					if did {
 						written++
 						present[k] = true
 					}

@@ -260,6 +260,8 @@ type Store interface {
 	LastSeal(ctx context.Context) (s Stored, ok bool, err error)
 	// Seals returns seals with first <= Seq <= last in order.
 	Seals(ctx context.Context, first, last int64) ([]Stored, error)
+	// PutProof stores p. It must fail when the seal does not exist or a
+	// proof from the same provider already exists for it.
 	PutProof(ctx context.Context, p Proof) error
 	// Proofs returns every proof stored for the seal.
 	Proofs(ctx context.Context, sealSeq int64) ([]Proof, error)

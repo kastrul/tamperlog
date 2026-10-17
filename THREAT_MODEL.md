@@ -50,17 +50,22 @@ handlers.
 Mechanism: CHECK constraints mirror the Go validation; a BEFORE INSERT
 trigger takes the same per-stream lock and refuses a record unless `seq` is
 the head plus one, `prev_hash` is the head's hash (genesis for `seq` 1), `at`
-is within 5 s of the database clock and not more than 1 s before the head,
-and the encoder and hasher match the head; triggers refuse UPDATE, DELETE and
+is within 5 s of the database clock (read after the lock) and not more than
+1 s before the head, the encoder and hasher match the head, attribute values
+are strings and, for the default `binary/v1` + `sha256` pair, the hash equals
+the one PostgreSQL recomputes from the row; triggers refuse UPDATE, DELETE and
 TRUNCATE for every role and are `ENABLE ALWAYS` on PostgreSQL so
 `session_replication_role = replica` does not silence them; seals and proofs
-have the same protections; the role template makes a sealed `NOLOGIN` owner
-and an INSERT-only application role.
+have the same protections (one proof per seal and provider); the role
+template makes a sealed `NOLOGIN` owner and an INSERT-only application role.
 
 Detects or prevents: for a client holding only INSERT (the application role,
-a compromised application), prevents backdating, chain poisoning (a wrong
-link that would break the chain forever), duplicate sequence numbers, skipped
-locks, and every UPDATE, DELETE and TRUNCATE.
+a compromised application), prevents backdating, duplicate sequence numbers,
+skipped locks, every UPDATE, DELETE and TRUNCATE, and, with the default
+algorithms on PostgreSQL, chain poisoning (a wrong hash that would break the
+chain forever). With `sha3-256` or `sha512-256`, which PostgreSQL cannot
+compute without extensions, and on SQLite, a wrong hash is not refused and is
+caught by the next verification instead.
 
 Cannot prevent: the table owner, a superuser, anyone with ADMIN on the owner
 role, root on the database host. They can disable triggers, rewrite rows and
@@ -135,10 +140,22 @@ outcome is appended to the system stream and should also go to monitoring.
 The offline CLI runs the same checks over an export bundle with no access to
 the system, which is what an auditor or regulator needs.
 
-Incremental verification re-links only records after a checkpoint, but
-always checks every seal, every sealed head and the checkpoint record's hash,
-so a rewrite before the checkpoint is caught at the next sealed head or at the
-checkpoint itself.
+Incremental verification re-links only records after a checkpoint. It still
+checks every seal, re-hashes every sealed head and compares the checkpoint
+record, so a rewrite that reaches a sealed head or the checkpoint is caught;
+an edit of a non-head record before the checkpoint that keeps its stored hash
+is not seen until the next full walk, which the runner forces on a schedule
+(default daily). The verifier also lists every configured sink and reports
+seals a sink holds beyond the source's last seal, which is how a rollback of
+database and records to an older authentic state shows up, and applies
+freshness policies (latest seal age, maximum interval, future skew) so an
+old but authentic state does not stay "verified" forever.
+
+Gaps are accepted only at the start of a stream: retention removes the
+oldest records. An inner gap is an error even with a sealed drop event, so
+appending a drop event cannot legitimise a deletion in the middle of history
+(a layout that drops inner ranges can opt in). Drop events not yet listed in a
+seal leave their gap pending rather than verified.
 
 ## Retention and erasure
 

@@ -37,7 +37,7 @@ else, and fails with a clear error if the result is weaker than intended.
 | `tamperlog_event` | one row per record; primary key `(stream, seq)`; CHECK constraints mirror the Go validation (stream, action and entity patterns, identifier lengths, hash sizes, `attributes` is a JSON object) |
 | `tamperlog_stream_head` | one row per stream, used only as a lock target in head-row mode |
 | `tamperlog_seal` | `seq`, `sealed_at`, `hash` (SHA-256 of `body`), `body` (canonical seal bytes) |
-| `tamperlog_proof` | `seal_seq`, `provider`, `obtained_at`, `body` |
+| `tamperlog_proof` | `seal_seq`, `provider`, `obtained_at`, `body`; one proof per seal and provider |
 | `tamperlog_schema` | installed schema version |
 
 Column types: `at`, `sealed_at`, `obtained_at` are `timestamptz`
@@ -50,7 +50,7 @@ recomputed in Go from the columns, never from a `jsonb` rendering, so
 
 | Trigger | Fires on | Effect |
 |---|---|---|
-| `tamperlog_event_check_link` | BEFORE INSERT | takes `pg_advisory_xact_lock(hashtextextended('tamperlog:' \|\| stream, 0))`, then refuses the row unless `seq = head + 1` (1 for an empty stream), `prev_hash = head.hash` (32 zero bytes for seq 1), `at` within 5 s of `clock_timestamp()` and not more than 1 s before the head's `at`, and `encoder`/`hasher` equal the head's |
+| `tamperlog_event_check_link` | BEFORE INSERT | takes `pg_advisory_xact_lock(hashtextextended('tamperlog:' \|\| stream, 0))`, then refuses the row unless `seq = head + 1` (1 for an empty stream), `prev_hash = head.hash` (32 zero bytes for seq 1), `at` within 5 s of `clock_timestamp()` read after the lock and not more than 1 s before the head's `at`, `encoder`/`hasher` equal the head's, every attribute value is a string, and, for `binary/v1` + `sha256`, `hash` equals `tamperlog_link_binary_v1_sha256(NEW)`, the Go link recomputed in SQL (`tamperlog_canonical_binary_v1` reproduces SPEC.md section 1.2 byte for byte and is asserted against the golden vector in the integration tests) |
 | `tamperlog_event_append_only` | BEFORE UPDATE OR DELETE | raises `insufficient_privilege` |
 | `tamperlog_event_no_truncate` | BEFORE TRUNCATE | raises |
 | `tamperlog_seal_check` | BEFORE INSERT | seal `seq` must be the last plus one |
@@ -60,9 +60,11 @@ All triggers are `ENABLE ALWAYS`, so `SET session_replication_role = replica`
 (a superuser's usual way of silencing triggers) does not disable them.
 
 What the triggers achieve: a client that holds only `INSERT` (the application
-role, or an attacker who stole its password) cannot backdate, cannot insert a
-wrong link that would poison the chain, cannot create duplicate sequence
-numbers, and cannot change or remove anything.
+role, or an attacker who stole its password) cannot backdate, cannot create
+duplicate sequence numbers, cannot change or remove anything, and with the
+default algorithms cannot insert a wrong hash that would poison the chain.
+With `sha3-256` or `sha512-256` the hash is not recomputed (PostgreSQL has no
+built-in SHA-3) and a wrong hash is caught by the verifier instead.
 
 What they do not achieve: the table owner, a superuser, anyone with `ADMIN`
 on `tamperlog_owner`, or root on the host can `ALTER TABLE … DISABLE

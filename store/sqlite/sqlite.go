@@ -75,8 +75,10 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 
 // Open opens a SQLite database with modernc.org/sqlite. dsn is a file path or
 // a "file:" URI, optionally with a query string; Open adds
-// _pragma=busy_timeout(5000), _pragma=journal_mode(WAL) and
-// _pragma=foreign_keys(ON), which apply to every pooled connection. Do not
+// _pragma=busy_timeout(5000), _pragma=journal_mode(WAL),
+// _pragma=foreign_keys(ON) and _pragma=recursive_triggers(ON) (so INSERT OR
+// REPLACE cannot delete behind the DELETE triggers), which apply to every
+// pooled connection. Do not
 // pass :memory:, since database/sql opens several connections and each would
 // see its own empty database. The caller owns the returned pool and runs
 // [Migrate] before [New].
@@ -89,6 +91,7 @@ func Open(dsn string) (*sql.DB, error) {
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "foreign_keys(ON)")
+	q.Add("_pragma", "recursive_triggers(ON)")
 	db, err := sql.Open("sqlite", path+"?"+q.Encode())
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open %q: %w", dsn, err)

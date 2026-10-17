@@ -69,6 +69,9 @@ func (s *Store) PutProof(_ context.Context, p seal.Proof) error {
 	if p.SealSeq < 1 || p.SealSeq > int64(len(s.seals.seals)) {
 		return fmt.Errorf("memory: proof for unknown seal %d", p.SealSeq)
 	}
+	if slices.ContainsFunc(s.seals.proofs[p.SealSeq], func(q seal.Proof) bool { return q.Provider == p.Provider }) {
+		return fmt.Errorf("memory: proof from %s already exists for seal %d", p.Provider, p.SealSeq)
+	}
 	s.seals.proofs[p.SealSeq] = append(s.seals.proofs[p.SealSeq], cloneProof(p))
 	return nil
 }

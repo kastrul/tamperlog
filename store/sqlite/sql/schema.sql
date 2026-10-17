@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS tamperlog_proof (
                              AND provider NOT GLOB '*[^a-z0-9._-]*'),
   obtained_at INTEGER NOT NULL CHECK (typeof(obtained_at) = 'integer'),
   body        BLOB    NOT NULL CHECK (typeof(body) = 'blob'),
-  PRIMARY KEY (seal_seq, provider, obtained_at)
+  PRIMARY KEY (seal_seq, provider)
 ) WITHOUT ROWID;
 
 -- Append-only: UPDATE and DELETE are refused on every tamperlog table. SQLite
@@ -158,12 +158,16 @@ END;
 
 -- A proof must point at a stored seal. The foreign key above says the same
 -- but is enforced only when the connection has PRAGMA foreign_keys = ON; the
--- trigger holds regardless.
+-- trigger holds regardless. The duplicate check refuses INSERT OR REPLACE,
+-- which would otherwise delete the old row without firing the DELETE trigger
+-- when recursive_triggers is off.
 DROP TRIGGER IF EXISTS tamperlog_proof_check;
 CREATE TRIGGER tamperlog_proof_check BEFORE INSERT ON tamperlog_proof
 BEGIN
   SELECT RAISE(ABORT, 'tamperlog: proof for an unknown seal')
   WHERE NOT EXISTS (SELECT 1 FROM tamperlog_seal WHERE seq = NEW.seal_seq);
+  SELECT RAISE(ABORT, 'tamperlog: proof already exists for this seal and provider')
+  WHERE EXISTS (SELECT 1 FROM tamperlog_proof WHERE seal_seq = NEW.seal_seq AND provider = NEW.provider);
 END;
 
 INSERT OR IGNORE INTO tamperlog_schema (version, applied_at)

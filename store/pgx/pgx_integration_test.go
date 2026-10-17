@@ -3,6 +3,7 @@
 package pgx_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -122,6 +123,7 @@ func TestTriggersEnforceChainShape(t *testing.T) {
 		"other hasher":      {"s", int64(2), time.Now(), "binary/v1", "sha3-256", r.Hash, zero},
 		"first not genesis": {"t", int64(1), time.Now(), "binary/v1", "sha256", r.Hash, zero},
 		"first not seq 1":   {"t", int64(2), time.Now(), "binary/v1", "sha256", zero, zero},
+		"wrong hash":        {"s", int64(2), time.Now(), "binary/v1", "sha256", r.Hash, bytes.Repeat([]byte{7}, 32)},
 	}
 	for name, args := range cases {
 		_, err := pool.Exec(ctx, insert, args...)
@@ -147,6 +149,22 @@ func TestTriggersEnforceChainShape(t *testing.T) {
 	next.Hash, _ = tamperlog.NewChain(nil, nil).Link(next)
 	if _, err := pool.Exec(ctx, insert, "s", int64(2), next.At, "binary/v1", "sha256", r.Hash, next.Hash); err != nil {
 		t.Fatalf("valid manual insert refused: %v", err)
+	}
+	// Non-string attribute values are refused.
+	if _, err := pool.Exec(ctx, "INSERT INTO "+ev+" (stream, seq, at, encoder, hasher, action, entity, attributes, prev_hash, hash) VALUES ('u', 1, now(), 'binary/v1', 'sha256', 'a', 'e', '{\"n\": 1}', $1, $1)", zero); err == nil {
+		t.Error("numeric attribute value accepted")
+	}
+	// The SQL canonical form equals the Go one for the golden record.
+	var canonical, link []byte
+	err = pool.QueryRow(ctx, `SELECT `+schema+`.tamperlog_canonical_binary_v1(e), `+schema+`.tamperlog_link_binary_v1_sha256(e) FROM (SELECT ROW('chat',1,'2026-10-13T12:00:00.123456Z'::timestamptz,'binary/v1','sha256','0199f5a0-0000-7000-8000-000000000001','','message.read','chat_message','0199f5a0-0000-7000-8000-000000000002',decode(repeat('aa',32),'hex'),'{"purpose":"treatment","channel":"web"}'::jsonb,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'))::`+schema+`.tamperlog_event AS e) AS x`).Scan(&canonical, &link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	golden := tamperlog.Record{Event: tamperlog.Event{Stream: "chat", Actor: "0199f5a0-0000-7000-8000-000000000001", Action: "message.read", Entity: "chat_message", EntityID: "0199f5a0-0000-7000-8000-000000000002", PayloadHash: bytes.Repeat([]byte{0xaa}, 32), Attributes: map[string]string{"purpose": "treatment", "channel": "web"}}, Seq: 1, At: time.Date(2026, 10, 13, 12, 0, 0, 123456000, time.UTC), PrevHash: zero}
+	wantCanonical, _ := tamperlog.BinaryV1.Encode(golden)
+	wantLink, _ := tamperlog.NewChain(nil, nil).Link(golden)
+	if !bytes.Equal(canonical, wantCanonical) || !bytes.Equal(link, wantLink) {
+		t.Fatalf("SQL canonical/link differ from Go:\n%x\n%x\n%x\n%x", canonical, wantCanonical, link, wantLink)
 	}
 	// Seals too.
 	if _, err := pool.Exec(ctx, "INSERT INTO "+schema+".tamperlog_seal (seq, sealed_at, hash, body) VALUES (5, now(), $1, 'x')", zero); err == nil {
