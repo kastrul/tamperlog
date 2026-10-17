@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -82,13 +83,19 @@ func (f *storeFlags) migrate(ctx context.Context) error {
 
 // sinkFlags configure write-once sinks.
 type sinkFlags struct {
-	SinkDir    string `name:"sink-dir" help:"Filesystem sink directory."`
-	S3Bucket   string `name:"s3-bucket" help:"S3 Object Lock bucket."`
-	S3Prefix   string `name:"s3-prefix" help:"Key prefix inside the bucket."`
-	S3Endpoint string `name:"s3-endpoint" help:"S3-compatible endpoint URL (Hetzner, MinIO); AWS when empty."`
-	S3Region   string `name:"s3-region" default:"eu-central-1" help:"S3 region name."`
+	SinkDir           string `name:"sink-dir" help:"Filesystem sink directory."`
+	S3Bucket          string `name:"s3-bucket" help:"S3 Object Lock bucket."`
+	S3Prefix          string `name:"s3-prefix" help:"Key prefix inside the bucket."`
+	S3Endpoint        string `name:"s3-endpoint" help:"S3-compatible endpoint URL (Hetzner, MinIO); AWS when empty."`
+	S3Region          string `name:"s3-region" default:"eu-central-1" help:"S3 region name."`
+	S3SkipPreflight   bool   `name:"s3-skip-preflight" help:"Do not check the bucket's Object Lock configuration at startup."`
+	S3AllowGovernance bool   `name:"s3-allow-governance" help:"Accept GOVERNANCE mode (bypassable by s3:BypassGovernanceRetention) instead of requiring COMPLIANCE."`
+	S3ProbeKey        string `name:"s3-probe-key" help:"Key for the preflight write-and-delete probe (one locked object per run); without it the probe is skipped."`
 }
 
+// sinks builds the configured sinks. The S3 sink runs its preflight first
+// and the result is printed, so an operator sees whether the bucket is
+// adequate for the administrator threat model before anything relies on it.
 func (f *sinkFlags) sinks(ctx context.Context) ([]seal.Sink, error) {
 	var out []seal.Sink
 	if f.SinkDir != "" {
@@ -109,7 +116,19 @@ func (f *sinkFlags) sinks(ctx context.Context) ([]seal.Sink, error) {
 				o.UsePathStyle = true
 			}
 		})
-		out = append(out, s3lock.New(client, f.S3Bucket, s3lock.WithPrefix(f.S3Prefix)))
+		sopts := []s3lock.Option{s3lock.WithPrefix(f.S3Prefix), s3lock.WithRequireLockedBucket(true), s3lock.WithRequireCompliance(!f.S3AllowGovernance)}
+		if f.S3ProbeKey != "" {
+			sopts = append(sopts, s3lock.WithProbeKey(f.S3ProbeKey))
+		}
+		sink := s3lock.New(client, f.S3Bucket, sopts...)
+		if !f.S3SkipPreflight {
+			info, err := sink.Check(ctx)
+			fmt.Fprintln(os.Stderr, info.String())
+			if err != nil {
+				return nil, fmt.Errorf("s3 preflight: %w (pass --s3-skip-preflight to proceed anyway)", err)
+			}
+		}
+		out = append(out, sink)
 	}
 	return out, nil
 }

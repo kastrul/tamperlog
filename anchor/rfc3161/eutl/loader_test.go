@@ -21,16 +21,17 @@ import (
 // own address, with ETag / Last-Modified and conditional-request support.
 type tlServer struct {
 	*httptest.Server
-	mu       sync.Mutex
-	requests []*http.Request
-	missing  map[string]bool
-	status   map[string]int
-	bodies   map[string]string
+	mu        sync.Mutex
+	requests  []*http.Request
+	missing   map[string]bool
+	status    map[string]int
+	bodies    map[string]string
+	redirects map[string]string // path -> Location of a 302
 }
 
 func newTLServer(t *testing.T) *tlServer {
 	t.Helper()
-	s := &tlServer{missing: map[string]bool{}, status: map[string]int{}, bodies: map[string]string{}}
+	s := &tlServer{missing: map[string]bool{}, status: map[string]int{}, bodies: map[string]string{}, redirects: map[string]string{}}
 	s.Server = httptest.NewUnstartedServer(http.HandlerFunc(s.handle))
 	s.Config.ErrorLog = log.New(io.Discard, "", 0)
 	s.StartTLS()
@@ -53,7 +54,12 @@ func (s *tlServer) handle(w http.ResponseWriter, r *http.Request) {
 	body, ok := s.bodies[r.URL.Path]
 	missing := s.missing[r.URL.Path]
 	status := s.status[r.URL.Path]
+	location := s.redirects[r.URL.Path]
 	s.mu.Unlock()
+	if location != "" {
+		http.Redirect(w, r, location, http.StatusFound)
+		return
+	}
 	if status != 0 {
 		w.WriteHeader(status)
 		return
@@ -111,7 +117,7 @@ func TestLoadWithoutCache(t *testing.T) {
 	if list.LOTL == nil || list.LOTL.SequenceNumber != 397 {
 		t.Fatalf("LOTL = %+v", list.LOTL)
 	}
-	if len(list.Services) != 3 || list.Lists["EE"] == nil {
+	if len(list.Services) != 4 || list.Lists["EE"] == nil {
 		t.Fatalf("services = %d, lists = %v", len(list.Services), list.Lists)
 	}
 	if err := list.Errors["LV"]; err == nil || !strings.Contains(err.Error(), "404") {
@@ -162,7 +168,7 @@ func TestCacheLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.count() != 2 || len(list.Services) != 3 {
+	if s.count() != 2 || len(list.Services) != 4 {
 		t.Fatalf("second load: requests = %v, services = %d", s.paths(), len(list.Services))
 	}
 
@@ -172,7 +178,7 @@ func TestCacheLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.count() != 4 || len(list.Services) != 3 {
+	if s.count() != 4 || len(list.Services) != 4 {
 		t.Fatalf("third load: requests = %v, services = %d", s.paths(), len(list.Services))
 	}
 	s.mu.Lock()
@@ -196,7 +202,7 @@ func TestCacheLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.count() != 4 || len(list.Services) != 3 {
+	if s.count() != 4 || len(list.Services) != 4 {
 		t.Fatalf("offline load: requests = %v, services = %d", s.paths(), len(list.Services))
 	}
 	if !errors.Is(list.Errors["LV"], ErrNotCached) {
@@ -236,7 +242,7 @@ func TestTerritoryFilter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Errors) != 0 || len(list.Services) != 3 {
+	if len(list.Errors) != 0 || len(list.Services) != 4 {
 		t.Fatalf("errors = %v, services = %d", list.Errors, len(list.Services))
 	}
 	for _, p := range s.paths() {
@@ -331,7 +337,7 @@ func TestPinnedLOTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Services) != 3 {
+	if len(list.Services) != 4 {
 		t.Fatalf("services = %d", len(list.Services))
 	}
 }
@@ -375,5 +381,168 @@ func TestContextCancelled(t *testing.T) {
 	cancel()
 	if _, err := s.loader(t).Load(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRedirects(t *testing.T) {
+	t.Run("https to https is followed", func(t *testing.T) {
+		s := newTLServer(t)
+		s.mu.Lock()
+		s.bodies["/lotl/moved.xml"] = s.bodies["/lotl/eu-lotl.xml"]
+		delete(s.bodies, "/lotl/eu-lotl.xml")
+		s.redirects["/lotl/eu-lotl.xml"] = s.URL + "/lotl/moved.xml"
+		s.mu.Unlock()
+		list, err := s.loader(t, WithTerritories("EE")).Load(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list.Services) != 4 {
+			t.Fatalf("services = %d", len(list.Services))
+		}
+	})
+	t.Run("https to http is refused", func(t *testing.T) {
+		s := newTLServer(t)
+		plain := "http://" + strings.TrimPrefix(s.URL, "https://")
+		s.mu.Lock()
+		s.redirects["/lotl/eu-lotl.xml"] = plain + "/lotl/eu-lotl.xml"
+		s.mu.Unlock()
+		if _, err := s.loader(t).Load(context.Background()); !errors.Is(err, ErrInsecureURL) {
+			t.Fatalf("err = %v", err)
+		}
+		if s.count() != 1 {
+			t.Fatalf("the http hop must not be requested: %v", s.paths())
+		}
+
+		// The same for a national list: recorded under its territory.
+		s.mu.Lock()
+		delete(s.redirects, "/lotl/eu-lotl.xml")
+		s.redirects["/tsl/ee-tl.xml"] = plain + "/tsl/ee-tl.xml"
+		s.mu.Unlock()
+		list, err := s.loader(t, WithTerritories("EE")).Load(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !errors.Is(list.Errors["EE"], ErrInsecureURL) || len(list.Services) != 0 {
+			t.Fatalf("EE error = %v, services = %d", list.Errors["EE"], len(list.Services))
+		}
+	})
+	t.Run("loop is cut after MaxRedirects", func(t *testing.T) {
+		s := newTLServer(t)
+		s.mu.Lock()
+		s.redirects["/lotl/eu-lotl.xml"] = s.URL + "/lotl/eu-lotl.xml"
+		s.mu.Unlock()
+		if _, err := s.loader(t).Load(context.Background()); !errors.Is(err, ErrTooManyRedirects) {
+			t.Fatalf("err = %v", err)
+		}
+		if n := s.count(); n > MaxRedirects+1 {
+			t.Fatalf("requests = %d", n)
+		}
+	})
+	t.Run("caller CheckRedirect still runs", func(t *testing.T) {
+		s := newTLServer(t)
+		s.mu.Lock()
+		s.bodies["/lotl/moved.xml"] = s.bodies["/lotl/eu-lotl.xml"]
+		s.redirects["/lotl/eu-lotl.xml"] = s.URL + "/lotl/moved.xml"
+		s.mu.Unlock()
+		client := s.Client()
+		sentinel := errors.New("no redirects for me")
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return sentinel }
+		_, err := NewLoader(WithHTTPClient(client), WithLOTLURL(s.URL+"/lotl/eu-lotl.xml")).Load(context.Background())
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("err = %v", err)
+		}
+		if client.CheckRedirect == nil {
+			t.Fatal("the caller's client must not be modified")
+		}
+	})
+}
+
+func TestLoadRecordsFreshness(t *testing.T) {
+	s := newTLServer(t)
+	list, err := s.loader(t, WithTerritories("EE")).Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !list.IssuedAt.Equal(list.LOTL.ListIssueDateTime) || !list.NextUpdate.Equal(time.Date(2027, 4, 7, 11, 6, 46, 0, time.UTC)) {
+		t.Fatalf("IssuedAt/NextUpdate = %v/%v", list.IssuedAt, list.NextUpdate)
+	}
+	if !list.Lists["EE"].NextUpdate.Equal(time.Date(2027, 3, 1, 9, 0, 0, 0, time.UTC)) {
+		t.Fatalf("EE NextUpdate = %v", list.Lists["EE"].NextUpdate)
+	}
+	check := Checker(list, nil, WithPolicy(Policy{RequireFresh: true, RequireTerritories: []string{"EE"}}), withClock(func() time.Time { return date(2027, 6, 1) }))
+	if _, err := check(loadCert(t, "rotated-new.pem"), date(2023, 1, 1)); !errors.Is(err, ErrListStale) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLoadWithRefresh(t *testing.T) {
+	s := newTLServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loader := s.loader(t, WithTerritories("EE"))
+
+	if _, err := loader.LoadWithRefresh(ctx, 0); err == nil {
+		t.Fatal("non-positive interval must error")
+	}
+	r, err := loader.LoadWithRefresh(ctx, 5*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Current().Lists["EE"].SequenceNumber != 88 || r.Err() != nil {
+		t.Fatalf("initial = %+v, %v", r.Current().Lists["EE"], r.Err())
+	}
+	check := r.Checker(nil)
+	if ok, err := check(loadCert(t, "rotated-new.pem"), date(2023, 1, 1)); err != nil || !ok {
+		t.Fatalf("checker over refresher = %v, %v", ok, err)
+	}
+
+	// The publisher issues sequence 89; the refresher picks it up.
+	s.mu.Lock()
+	s.bodies["/tsl/ee-tl.xml"] = strings.Replace(s.bodies["/tsl/ee-tl.xml"], "<TSLSequenceNumber>88<", "<TSLSequenceNumber>89<", 1)
+	s.mu.Unlock()
+	waitFor(t, func() bool { return r.Current().Lists["EE"].SequenceNumber == 89 })
+
+	// A failing reload keeps the last good list and surfaces the error.
+	s.mu.Lock()
+	s.status["/lotl/eu-lotl.xml"] = http.StatusInternalServerError
+	s.mu.Unlock()
+	waitFor(t, func() bool { return r.Err() != nil })
+	if r.Current().Lists["EE"].SequenceNumber != 89 {
+		t.Fatalf("list replaced after a failed reload: %+v", r.Current().Lists["EE"])
+	}
+	if ok, err := check(loadCert(t, "rotated-new.pem"), date(2023, 1, 1)); err != nil || !ok {
+		t.Fatalf("checker after failed reload = %v, %v", ok, err)
+	}
+
+	// Recovery clears the error.
+	s.mu.Lock()
+	delete(s.status, "/lotl/eu-lotl.xml")
+	s.mu.Unlock()
+	waitFor(t, func() bool { return r.Err() == nil })
+
+	cancel()
+	select {
+	case <-r.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("refresh loop did not stop")
+	}
+
+	// An initial failure is returned directly.
+	s.mu.Lock()
+	s.missing["/lotl/eu-lotl.xml"] = true
+	s.mu.Unlock()
+	if _, err := loader.LoadWithRefresh(context.Background(), time.Second); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in time")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }

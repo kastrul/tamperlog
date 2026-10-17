@@ -18,41 +18,58 @@ import (
 // "Example Qualified TSA" service in testdata/ee-tl.xml) and its key.
 func testCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
 	t.Helper()
-	cb, err := os.ReadFile(filepath.Join("testdata", "ca.pem"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	block, _ := pem.Decode(cb)
-	if block == nil {
-		t.Fatal("testdata/ca.pem: no PEM block")
-	}
+	return loadCert(t, "ca.pem"), loadKey(t, "ca-key.pem")
+}
+
+// loadCert reads a PEM certificate from testdata.
+func loadCert(t *testing.T, name string) *x509.Certificate {
+	t.Helper()
+	block := loadPEM(t, name)
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	kb, err := os.ReadFile(filepath.Join("testdata", "ca-key.pem"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	block, _ = pem.Decode(kb)
-	if block == nil {
-		t.Fatal("testdata/ca-key.pem: no PEM block")
-	}
+	return cert
+}
+
+// loadKey reads a PEM EC private key from testdata.
+func loadKey(t *testing.T, name string) *ecdsa.PrivateKey {
+	t.Helper()
+	block := loadPEM(t, name)
 	key, err := x509.ParseECPrivateKey(block.Bytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cert, key
+	return key
 }
 
-// issue creates a certificate with the given subject and key identifier,
-// signed by parent (self-signed when parent is nil).
+func loadPEM(t *testing.T, name string) *pem.Block {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		t.Fatalf("testdata/%s: no PEM block", name)
+	}
+	return block
+}
+
+// issue creates a certificate with a fresh key, the given subject and key
+// identifier, signed by parent (self-signed when parent is nil).
 func issue(t *testing.T, subject pkix.Name, ski []byte, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) *x509.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return issueWithKey(t, subject, ski, key, parent, parentKey)
+}
+
+// issueWithKey is issue for a given subject key.
+func issueWithKey(t *testing.T, subject pkix.Name, ski []byte, key *ecdsa.PrivateKey, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) *x509.Certificate {
+	t.Helper()
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject:      subject,
@@ -93,10 +110,23 @@ func loadFixtureTL(t *testing.T) *TL {
 
 func fixtureList(t *testing.T) *List {
 	t.Helper()
-	tl := loadFixtureTL(t)
+	return listOf(loadFixtureTL(t))
+}
+
+func listOf(tl *TL) *List {
 	return &List{Lists: map[string]*TL{tl.Territory: tl}, Services: tl.Services, Errors: map[string]error{}}
 }
 
 func date(y int, m time.Month, d int) time.Time {
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+// readFixture returns the bytes of a testdata file.
+func readFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

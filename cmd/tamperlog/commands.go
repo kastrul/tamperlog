@@ -474,11 +474,13 @@ func (versionCmd) Run(*runContext) error {
 // ---- TSA flags ----
 
 type tsaFlags struct {
-	TSAURL      string `name:"tsa-url" help:"RFC 3161 endpoint, for example http://tsa.demo.sk.ee/tsa."`
-	TSARoots    string `name:"tsa-roots" type:"existingfile" help:"PEM file with the TSA root certificate(s) to trust."`
-	TSAPolicy   string `name:"tsa-policy" help:"Required TSA policy OID."`
-	EUTLCache   string `name:"eutl-cache" help:"Directory caching the EU Trusted List; enables qualified-status checks."`
-	EUTLOffline bool   `name:"eutl-offline" help:"Read the EU Trusted List from the cache only."`
+	TSAURL          string        `name:"tsa-url" help:"RFC 3161 endpoint, for example http://tsa.demo.sk.ee/tsa."`
+	TSARoots        string        `name:"tsa-roots" type:"existingfile" help:"PEM file with the TSA root certificate(s) to trust."`
+	TSAPolicy       string        `name:"tsa-policy" help:"Required TSA policy OID."`
+	EUTLCache       string        `name:"eutl-cache" help:"Directory caching the EU Trusted List; enables qualified-status checks."`
+	EUTLOffline     bool          `name:"eutl-offline" help:"Read the EU Trusted List from the cache only (lists may then be stale; freshness is not enforced)."`
+	EUTLTerritories []string      `name:"eutl-territories" help:"Territories to load and require, for example EE; default all." sep:","`
+	EUTLRefresh     time.Duration `name:"eutl-refresh" default:"24h" help:"How often long-running commands reload the trusted lists."`
 }
 
 // provider builds the rfc3161 anchor provider. needClient requires --tsa-url.
@@ -507,11 +509,23 @@ func (f *tsaFlags) provider(ctx context.Context, needClient bool) (anchor.Provid
 		if f.EUTLOffline {
 			lopts = append(lopts, eutl.WithOffline())
 		}
-		list, err := eutl.NewLoader(lopts...).Load(ctx)
+		if len(f.EUTLTerritories) > 0 {
+			lopts = append(lopts, eutl.WithTerritories(f.EUTLTerritories...))
+		}
+		// Fresh lists and every requested territory are required unless the
+		// operator chose the offline cache, where staleness is accepted
+		// knowingly. The refresher reloads for long-running commands.
+		policy := eutl.Policy{RequireFresh: !f.EUTLOffline, RequireTerritories: f.EUTLTerritories}
+		refresher, err := eutl.NewLoader(lopts...).LoadWithRefresh(ctx, f.EUTLRefresh)
 		if err != nil {
 			return nil, fmt.Errorf("eu trusted list: %w", err)
 		}
-		vopts = append(vopts, rfc3161.WithQualifiedChecker(eutl.Checker(list, nil)))
+		if list := refresher.Current(); list != nil {
+			for territory, lerr := range list.Errors {
+				fmt.Fprintf(os.Stderr, "eu trusted list: %s not loaded: %v\n", territory, lerr)
+			}
+		}
+		vopts = append(vopts, rfc3161.WithQualifiedChecker(refresher.Checker(nil, eutl.WithPolicy(policy))))
 	}
 	verifier := rfc3161.NewVerifier(roots, vopts...)
 	if needClient && f.TSAURL == "" {

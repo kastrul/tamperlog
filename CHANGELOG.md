@@ -40,8 +40,8 @@ Initial development towards v0.1.0.
 - OpenTelemetry metrics through hooks; `tamperlog` CLI (migrate, append,
   seal, anchor, verify, export, resync, inspect).
 - Documentation: README, SPEC.md, THREAT_MODEL.md, design document, fifteen
-  ADRs, backend, anchor and sink guides, PADI migration note, examples, two
-  independent review rounds with their outcomes.
+  ADRs, backend, anchor and sink guides, PADI migration note, examples, three
+  independent review rounds with their outcomes (docs/reviews/).
 
 ### Wire formats introduced
 

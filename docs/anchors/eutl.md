@@ -36,7 +36,8 @@ Facts confirmed against the live LOTL (sequence 397, October 2026):
   (`X509Certificate` base64 DER, `X509SKI`, `X509SubjectName`), `ServiceStatus`
   and `StatusStartingTime`, plus `ServiceHistory/ServiceHistoryInstance`
   entries with the same shape for earlier periods. History instances carry
-  their own digital identity and type; the loader merges them.
+  their own digital identity and type; the parser keeps each identity with
+  its own period (`StatusPeriod.Identity`) and never merges them.
 - Time-stamping types: `http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST`
   (qualified), `.../TSA/TSS-QC` and `.../TSA` (not qualified).
 - Statuses: `http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted` and
@@ -62,10 +63,10 @@ that presumption; a non-qualified time stamp is merely admissible evidence
 
 For a tamperlog seal, `Qualified = true` therefore means: the RFC 3161 token
 verified cryptographically, its TSA certificate (or the CA that issued it) is
-the digital identity of a service of type QTST on a member state's trusted
-list, and that service's status at `genTime` was `granted`. An auditor can
-reproduce this from the seal's proof bytes and an archived copy of the lists
-(see "Reproducible verification" below).
+the key-authenticated digital identity listed for the status period of a
+QTST service that contains `genTime`, and that period's status is `granted`.
+An auditor can reproduce this from the seal's proof bytes and an archived
+copy of the lists (see "Reproducible verification" below).
 
 ## Loading and caching
 
@@ -82,38 +83,88 @@ if err != nil {
 for territory, err := range list.Errors {
     log.Printf("eutl: %s skipped: %v", territory, err) // a national list failed
 }
-if time.Now().After(list.LOTL.NextUpdate) {
-    return errors.New("LOTL is past its NextUpdate; refusing to trust it")
+policy := eutl.Policy{RequireFresh: true, RequireTerritories: []string{"EE"}}
+if err := policy.Check(list, time.Now()); err != nil {
+    return err // stale LOTL or national list, or EE did not load
 }
 ```
 
 `Load` fetches the LOTL, then the selected national lists four at a time,
-each limited to 32 MiB and required to be `https`. A national list that fails
+each limited to 32 MiB and required to be `https` for the initial URL and
+for every redirect hop (at most five; a hop to `http` fails the download
+with `ErrInsecureURL`). A national list that fails
 to download or parse is skipped and recorded in `List.Errors`; only a LOTL
 failure fails the call. With a cache directory each list is served from disk
 while younger than the max age and revalidated with `If-None-Match` /
 `If-Modified-Since` afterwards (ec.europa.eu returns `ETag` and
 `Last-Modified`; a `304` refreshes the cache timestamp without a download).
-`NextUpdate` is exposed on `List.LOTL` and on every `List.Lists[territory]`
-so the caller can refuse stale lists; it is the zero time for a closed list
-(the UK list has an empty `NextUpdate`).
+`NextUpdate` is exposed as `List.NextUpdate` (the LOTL's, with
+`List.IssuedAt`) and on every `List.Lists[territory]`; it is the zero time
+for a closed list (the UK list has an empty `NextUpdate`).
 
 Wire the result into the RFC 3161 verifier through the adapter:
 
 ```go
 check := eutl.Checker(list, func(c *x509.Certificate) []*x509.Certificate {
     return issuersOf(c) // the CA chain the verifier built for the TSA certificate
-})
+}, eutl.WithPolicy(eutl.Policy{RequireFresh: true, RequireTerritories: []string{"EE"}}))
 verifier := rfc3161.NewVerifier(roots, rfc3161.WithQualifiedChecker(check))
 ```
 
 `chainResolver` matters: some lists identify a time-stamping service by the
 time-stamp unit's own certificate, others by the CA that issues TSU
 certificates. `List.Lookup(cert, chain)` tries the TSA certificate and every
-chain element, by exact DER first, then by subject key identifier, then by
-subject name. `Match.By` reports which; a `"subject"` match is the weakest
-and is only trustworthy because the verifier has already validated the chain
-to pinned roots.
+chain element against the identity of every status period of every service
+and reports, per service, the periods that matched and how (`Match.By`,
+`Match.Periods`).
+
+### Which matches count
+
+Only a *key-authenticated* match can make a certificate qualified:
+
+- `certificate`: the list carries the exact DER of the candidate.
+- `public-key`: a listed certificate carries the same `SubjectPublicKeyInfo`
+  as the candidate (a re-issued CA certificate with the same key).
+- `ski`: a listed `X509SKI` equals the SHA-1 of the candidate's public key
+  *as computed by the verifier* (RFC 5280 §4.2.1.2 method 1). The
+  `SubjectKeyId` extension the candidate asserts is never consulted: it is
+  chosen by whoever issued the candidate, so any CA the verifier trusts could
+  mint a certificate carrying a listed value. An `X509SKI` is also ignored
+  when the same identity lists a certificate, because the certificate is then
+  the authoritative key and a stale SKI next to it must not resurrect a
+  retired key.
+- `subject`: only the subject distinguished name matched. This is reported by
+  `Lookup` so a negative answer can be explained, and never makes `Qualified`
+  true. Chain validation does not make it trustworthy: a different entity
+  can hold a certificate with the same subject issued by another CA that the
+  verifier was told to trust.
+
+### Per-period matching
+
+The decision for a token is made against the status period whose
+`[StatusStartingTime, next StatusStartingTime)` contains `genTime`
+(`Service.StatusAt`). That period's status must be `granted`, its type
+`QTST`, and *its own* digital identity must key-authenticate the TSA
+certificate or a chain element. A key that a list names only in some other
+period (for example a retired CA that appears in a `withdrawn` history
+instance) therefore never qualifies outside that period, even though the same
+service is `granted` again later under a new key. `Service.QualifiedAt(cert,
+chain, at)` and `List.Qualified` implement this rule.
+
+One accommodation exists for how lists are actually written. ETSI TS 119 612
+lets a `ServiceHistoryInstance` repeat only the `X509SubjectName` (or
+`X509SKI`) of the identity in `ServiceInformation` rather than the full
+certificate, and many lists do exactly that. A period whose identity names no
+key at all (subject only, or empty) is taken to refer to the key in the
+current `ServiceInformation`: the candidate must then be key-authenticated by
+the *current* identity and must bear the subject name the history instance
+gives, if it gives one. A period that does name a key (a certificate or an
+SKI) is matched against that key only, with no fallback.
+
+Two structural defects make a service unusable rather than ambiguous: two
+periods starting at the same instant, or a history instance dated after the
+current status. They are recorded in `Service.Problems` and such a service
+is never qualified.
 
 ## Signature caveat and mitigation
 
@@ -129,7 +180,15 @@ Mitigations available today:
 
 - `WithPinnedLOTLSHA256(hex)` fails `Load` unless the LOTL bytes hash to the
   pinned digest. Record the digest of the LOTL that was current when a seal
-  was anchored and pin it when re-verifying from an evidence bundle.
+  was anchored and pin it when re-verifying from an evidence bundle. Note
+  what the pin covers: the LOTL bytes only. The national lists are not
+  signature-checked and the LOTL does not carry their digests, so the pin
+  does not authenticate the national-list bytes in a cache directory. Those
+  bytes are trusted because TLS to the publisher was verified when they were
+  downloaded and because the cache directory's file permissions (`0700`)
+  kept them intact afterwards. An evidence bundle should therefore record
+  the SHA-256 of each national list it relies on as well, and the verifier
+  should compare the archived file against it before `WithOffline()` use.
 - `WithOffline()` reads only the cache, so verification can run on an
   air-gapped machine from an archived cache directory.
 - Each `Pointer.SigningCertificates` carries the certificates the LOTL names
@@ -148,6 +207,42 @@ least once a day (the default 24 h cache max age encodes this) and alert when
 `List.Errors` is non-empty for a territory you depend on or when a list's
 `NextUpdate` has passed. The revalidation step is cheap: a current LOTL
 answers `304` and no body is transferred.
+
+A long-running verifier should not keep one `List` forever. `Loader.
+LoadWithRefresh(ctx, every)` loads once, fails if that load fails, and then
+reloads on the interval until `ctx` ends; `Refresher.Current()` is the latest
+good list, `Refresher.Err()` the error of the latest reload, and
+`Refresher.Checker(chainResolver, opts...)` evaluates every token against the
+list current at that moment:
+
+```go
+r, err := loader.LoadWithRefresh(ctx, 6*time.Hour)
+if err != nil {
+    return err
+}
+check := r.Checker(issuersOf, eutl.WithPolicy(eutl.Policy{
+    RequireFresh:       true,            // fail once any used list is past NextUpdate
+    RequireTerritories: []string{"EE"},  // fail if the Estonian list did not load
+}))
+```
+
+The policy is enforced on every call and a failure is returned as an
+*error*, not as `Qualified = false`: the RFC 3161 verifier wraps it in
+`anchor.ErrInvalidProof`, so a stale or incomplete list fails verification
+loudly instead of quietly downgrading seals. `Policy` has three knobs:
+
+- `RequireFresh`: fail while the LOTL's `NextUpdate` or that of any loaded
+  national list is in the past at check time (closed lists, with a zero
+  `NextUpdate`, are never stale).
+- `RequireTerritories`: fail while any named territory is absent from
+  `List.Lists`, whether it failed to load (`List.Errors`) or was filtered
+  out.
+- `AllowHistorical`: accept a certificate that is key-authenticated only by
+  a history instance, that is a key the service no longer lists in its
+  `ServiceInformation`, for the granted period in which it was listed. Off
+  by default; the period containing `genTime` must be `granted`/`QTST`
+  either way, so old tokens of a service that kept its key verify without
+  it. `cmd/tamperlog` uses the zero policy.
 
 Publisher quirks observed in October 2026, all recorded in `List.Errors`
 rather than failing `Load`:
@@ -179,7 +274,13 @@ is `Qualified` because the period in force at its `genTime` is `granted`/
 `QTST`; a seal anchored in 2015 is not, although the certificate matches, and
 a seal anchored after a withdrawal is not either. The test fixture
 `anchor/rfc3161/eutl/testdata/ee-tl.xml` encodes this shape with a synthetic
-provider and dates (granted 2016, withdrawn 2030).
+provider and dates (granted 2016, withdrawn 2030). The same fixture carries a
+second, key-rotating service: its 2018 CA is listed in a `granted` and then
+a `withdrawn` history instance, and a 2022 CA in the current `granted`
+`ServiceInformation`. Tokens under the 2018 CA are qualified in 2019 (with
+`AllowHistorical`), not in 2021 (withdrawn) and not in 2023 (that period's
+identity is the 2022 CA); tokens under the 2022 CA are qualified in 2023 and
+not in 2019.
 
 Two consequences for long retention:
 

@@ -33,20 +33,98 @@ const (
 	StatusWithdrawn = "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn"
 )
 
-// Match methods reported in [Match.By], strongest first.
+// Match methods reported in [Match.By] and [PeriodMatch.By], strongest
+// first. The first three are key-authenticated and can make a certificate
+// qualified; [BySubject] is reported by [List.Lookup] for diagnosis only and
+// never makes [List.Qualified] true.
 const (
-	// ByCertificate means the list carries the exact DER certificate.
+	// ByCertificate means the identity carries the exact DER certificate.
 	ByCertificate = "certificate"
-	// BySKI means the list carries the certificate's subject key identifier.
+	// ByPublicKey means a listed certificate carries the same
+	// SubjectPublicKeyInfo as the candidate (a re-issued CA certificate).
+	ByPublicKey = "public-key"
+	// BySKI means a listed X509SKI equals the SHA-1 of the candidate's public
+	// key as computed by this package (RFC 5280 §4.2.1.2 method 1). The
+	// SubjectKeyId extension the candidate asserts is never consulted, and
+	// X509SKI values are ignored when the same identity also lists a
+	// certificate, because the certificate is then the authoritative key.
 	BySKI = "ski"
-	// BySubject means only the subject distinguished name matched. Treat as
-	// weak evidence; it relies on the chain having been validated elsewhere.
+	// BySubject means only the subject distinguished name matched. Anyone
+	// holding a certificate with that subject from any CA the verifier
+	// trusts would match, so this is evidence for a human, not for Qualified.
 	BySubject = "subject"
 )
 
+// Identity is the ServiceDigitalIdentity listed for one status period.
+type Identity struct {
+	// Certificates are the parsable X509Certificate digital identities.
+	Certificates []*x509.Certificate
+	// SKIs are the X509SKI digital identities (raw key identifier bytes).
+	SKIs [][]byte
+	// SubjectNames are the X509SubjectName digital identities as written.
+	SubjectNames []string
+
+	// rawCertificates holds the DER of every X509Certificate digital
+	// identity, including ones crypto/x509 could not parse, for exact matching.
+	rawCertificates [][]byte
+}
+
+// hasKeyMaterial reports whether the identity names a key at all, as opposed
+// to a subject-name-only (or empty) history instance.
+func (id *Identity) hasKeyMaterial() bool {
+	return len(id.rawCertificates) > 0 || len(id.SKIs) > 0
+}
+
+// match reports whether and how the identity covers c. Only [BySubject] is
+// a weak match; see the By constants for the rules.
+func (id *Identity) match(c *x509.Certificate) (string, bool) {
+	for _, raw := range id.rawCertificates {
+		if bytes.Equal(raw, c.Raw) {
+			return ByCertificate, true
+		}
+	}
+	for _, listed := range id.Certificates {
+		if len(listed.RawSubjectPublicKeyInfo) > 0 && bytes.Equal(listed.RawSubjectPublicKeyInfo, c.RawSubjectPublicKeyInfo) {
+			return ByPublicKey, true
+		}
+	}
+	if len(id.rawCertificates) == 0 {
+		if ski := publicKeyIdentifier(c); len(ski) > 0 {
+			for _, want := range id.SKIs {
+				if bytes.Equal(want, ski) {
+					return BySKI, true
+				}
+			}
+		}
+	}
+	if id.matchesSubject(c) {
+		return BySubject, true
+	}
+	return "", false
+}
+
+// strong reports whether the identity authenticates c by key.
+func (id *Identity) strong(c *x509.Certificate) bool {
+	by, ok := id.match(c)
+	return ok && by != BySubject
+}
+
+func (id *Identity) matchesSubject(c *x509.Certificate) bool {
+	if len(id.SubjectNames) == 0 {
+		return false
+	}
+	have := subjectAttributes(c.Subject)
+	for _, name := range id.SubjectNames {
+		if want, err := parseDN(name); err == nil && equalAttributes(want, have) {
+			return true
+		}
+	}
+	return false
+}
+
 // StatusPeriod is one entry of a service's status history: the service had
 // Status (and, when the list records it, Type) from From until the next
-// period starts.
+// period starts, and was identified by Identity during that period.
 type StatusPeriod struct {
 	// Status is the status URI, such as [StatusGranted].
 	Status string
@@ -55,6 +133,17 @@ type StatusPeriod struct {
 	Type string
 	// From is when the status took effect (StatusStartingTime).
 	From time.Time
+	// Identity is the ServiceDigitalIdentity the list gives for this period:
+	// the ServiceInformation's for the current period, the
+	// ServiceHistoryInstance's for a historical one.
+	Identity Identity
+}
+
+func (p *StatusPeriod) typeOr(def string) string {
+	if p.Type != "" {
+		return p.Type
+	}
+	return def
 }
 
 // Service is one TSPService entry of a national trusted list.
@@ -67,59 +156,112 @@ type Service struct {
 	Name string
 	// Type is the current service type URI, such as [TypeQTST].
 	Type string
-	// Certificates are the parsable X509Certificate digital identities of the
-	// service, merged from the current information and every history instance.
-	Certificates []*x509.Certificate
-	// SKIs are the X509SKI digital identities (raw key identifier bytes).
-	SKIs [][]byte
-	// SubjectNames are the X509SubjectName digital identities as written.
-	SubjectNames []string
 	// History is every status period in ascending order of From; the last
-	// element is the current status.
+	// element is the current status (the ServiceInformation).
 	History []StatusPeriod
+	// Problems records structural defects of the entry, such as two status
+	// periods starting at the same instant or a history instance dated after
+	// the current status. A service with problems is never qualified.
+	Problems []string
+}
 
-	// rawCertificates holds the DER of every X509Certificate digital
-	// identity, including ones crypto/x509 could not parse, for exact matching.
-	rawCertificates [][]byte
+// Current returns the current status period (the ServiceInformation).
+func (s *Service) Current() StatusPeriod {
+	return s.History[len(s.History)-1]
 }
 
 // StatusAt returns the period in force at t, or false when the service was
 // not yet listed.
 func (s *Service) StatusAt(t time.Time) (StatusPeriod, bool) {
-	var found StatusPeriod
-	ok := false
-	for _, p := range s.History {
-		if p.From.After(t) {
-			break
-		}
-		found, ok = p, true
+	i, ok := s.periodAt(t)
+	if !ok {
+		return StatusPeriod{}, false
 	}
-	return found, ok
+	return s.History[i], true
 }
 
-// QualifiedAt reports whether the service was a granted qualified
-// time-stamping service at t.
-func (s *Service) QualifiedAt(t time.Time) bool {
-	p, ok := s.StatusAt(t)
-	if !ok || p.Status != StatusGranted {
+func (s *Service) periodAt(t time.Time) (int, bool) {
+	found := -1
+	for i := range s.History {
+		if s.History[i].From.After(t) {
+			break
+		}
+		found = i
+	}
+	return found, found >= 0
+}
+
+// QualifiedAt reports whether cert, or one of the certificates in chain, was
+// the key-authenticated digital identity of this service while it was a
+// granted qualified time-stamping service, at time at.
+//
+// The decision is made against the status period whose [From, next.From)
+// contains at: its status must be [StatusGranted], its type [TypeQTST], and
+// its Identity must authenticate the candidate by certificate, public key or
+// computed key identifier. One exception accommodates lists whose history
+// instances carry only an X509SubjectName (ETSI TS 119 612 lets them omit
+// the certificate): a period whose Identity names no key is taken to refer
+// to the key in the current ServiceInformation, so the candidate must be
+// key-authenticated by the current period's Identity and must bear the
+// subject name the history instance gives, if any. A subject-name match is
+// never sufficient on its own, a key listed only in another period never
+// qualifies outside that period, and a service with Problems never
+// qualifies. Historical identities (keys listed only in a history instance)
+// are accepted here; [Policy.AllowHistorical] controls that for [Checker].
+func (s *Service) QualifiedAt(cert *x509.Certificate, chain []*x509.Certificate, at time.Time) bool {
+	return s.qualifiedAt(candidates(cert, chain), at, true)
+}
+
+func (s *Service) qualifiedAt(cands []*x509.Certificate, at time.Time, allowHistorical bool) bool {
+	if len(s.Problems) > 0 || len(cands) == 0 {
 		return false
 	}
-	typ := p.Type
-	if typ == "" {
-		typ = s.Type
+	i, ok := s.periodAt(at)
+	if !ok {
+		return false
 	}
-	return typ == TypeQTST
+	p := &s.History[i]
+	if p.Status != StatusGranted || p.typeOr(s.Type) != TypeQTST {
+		return false
+	}
+	cur := &s.History[len(s.History)-1].Identity
+	for _, c := range cands {
+		inCurrent := cur.strong(c)
+		if p.Identity.strong(c) {
+			if allowHistorical || inCurrent {
+				return true
+			}
+			continue
+		}
+		if !p.Identity.hasKeyMaterial() && inCurrent && (len(p.Identity.SubjectNames) == 0 || p.Identity.matchesSubject(c)) {
+			return true
+		}
+	}
+	return false
+}
+
+// PeriodMatch is one status period whose identity matched a candidate.
+type PeriodMatch struct {
+	// Period is the matched status period.
+	Period StatusPeriod
+	// By says how the period's identity matched: one of the By constants.
+	By string
+	// Certificate is the candidate (the TSA certificate or a chain element)
+	// that the period's identity matched.
+	Certificate *x509.Certificate
 }
 
 // Match is one service that identifies a certificate.
 type Match struct {
 	// Service is the matched service.
 	Service *Service
-	// By says how the match was made: [ByCertificate], [BySKI] or [BySubject].
+	// By is the strongest match method over Periods.
 	By string
-	// Certificate is the certificate (the TSA certificate or a chain element)
-	// that the service's digital identity matched.
+	// Certificate is the candidate that produced the strongest match.
 	Certificate *x509.Certificate
+	// Periods lists every status period whose identity matched, in
+	// ascending order of From, with the strongest method found for each.
+	Periods []PeriodMatch
 }
 
 // List is the merged content of the loaded trusted lists.
@@ -127,63 +269,70 @@ type List struct {
 	// LOTL is the List of Trusted Lists the national lists were taken from;
 	// nil when the List was assembled without one.
 	LOTL *LOTL
-	// Lists holds the metadata of every national list that loaded, by territory.
+	// IssuedAt is the LOTL's ListIssueDateTime; zero without a LOTL.
+	IssuedAt time.Time
+	// NextUpdate is the LOTL's NextUpdate; zero without a LOTL or for a
+	// closed list. [Policy.RequireFresh] refuses a List past this time.
+	NextUpdate time.Time
+	// Lists holds every national list that loaded, by territory; each
+	// carries its own NextUpdate.
 	Lists map[string]*TL
 	// Services are all services of all loaded lists.
 	Services []*Service
 	// Errors records, by territory, national lists that failed to download
-	// or parse and were therefore skipped.
+	// or parse and were therefore skipped. [Policy.RequireTerritories]
+	// turns such an entry into a check failure.
 	Errors map[string]error
 	// LoadedAt is when the List was assembled.
 	LoadedAt time.Time
 }
 
-// Lookup returns every service whose digital identity matches cert or one of
-// the certificates in chain. Each service appears once, with the strongest
-// match method found.
+// Lookup returns every service whose digital identity, in any status period,
+// matches cert or one of the certificates in chain. Each service appears
+// once, with the strongest match method found and the periods that matched.
+// Weak ([BySubject]) matches are included so callers can explain a negative
+// [List.Qualified] answer; see the By constants.
 func (l *List) Lookup(cert *x509.Certificate, chain []*x509.Certificate) []Match {
 	if l == nil || cert == nil {
 		return nil
 	}
-	candidates := make([]*x509.Certificate, 0, 1+len(chain))
-	candidates = append(candidates, cert)
-	for _, c := range chain {
-		if c != nil {
-			candidates = append(candidates, c)
-		}
-	}
-	best := map[*Service]Match{}
-	var order []*Service
+	cands := candidates(cert, chain)
+	var out []Match
 	for _, svc := range l.Services {
-		for _, c := range candidates {
-			by, ok := svc.matches(c)
-			if !ok {
+		m := Match{Service: svc}
+		for _, p := range svc.History {
+			var pm PeriodMatch
+			for _, c := range cands {
+				by, ok := p.Identity.match(c)
+				if ok && (pm.By == "" || rank(by) < rank(pm.By)) {
+					pm = PeriodMatch{Period: p, By: by, Certificate: c}
+				}
+			}
+			if pm.By == "" {
 				continue
 			}
-			prev, seen := best[svc]
-			if !seen {
-				order = append(order, svc)
-			}
-			if !seen || rank(by) < rank(prev.By) {
-				best[svc] = Match{Service: svc, By: by, Certificate: c}
+			m.Periods = append(m.Periods, pm)
+			if m.By == "" || rank(pm.By) < rank(m.By) {
+				m.By, m.Certificate = pm.By, pm.Certificate
 			}
 		}
-	}
-	if len(order) == 0 {
-		return nil
-	}
-	out := make([]Match, 0, len(order))
-	for _, svc := range order {
-		out = append(out, best[svc])
+		if len(m.Periods) > 0 {
+			out = append(out, m)
+		}
 	}
 	return out
 }
 
 // Qualified reports whether cert was issued under a service that was a
 // granted qualified time-stamping service at the time at, together with the
-// services that matched. It returns an error for a nil certificate or a zero
-// time; a certificate no list knows yields (false, nil, nil).
+// services that matched. The rule is that of [Service.QualifiedAt], with
+// historical identities accepted. It returns an error for a nil certificate
+// or a zero time; a certificate no list knows yields (false, nil, nil).
 func (l *List) Qualified(cert *x509.Certificate, chain []*x509.Certificate, at time.Time) (bool, []Match, error) {
+	return l.qualified(cert, chain, at, true)
+}
+
+func (l *List) qualified(cert *x509.Certificate, chain []*x509.Certificate, at time.Time, allowHistorical bool) (bool, []Match, error) {
 	if l == nil {
 		return false, nil, errors.New("eutl: nil list")
 	}
@@ -194,57 +343,49 @@ func (l *List) Qualified(cert *x509.Certificate, chain []*x509.Certificate, at t
 		return false, nil, errors.New("eutl: zero time")
 	}
 	matches := l.Lookup(cert, chain)
+	cands := candidates(cert, chain)
 	for _, m := range matches {
-		if m.Service.QualifiedAt(at) {
+		if m.Service.qualifiedAt(cands, at, allowHistorical) {
 			return true, matches, nil
 		}
 	}
 	return false, matches, nil
 }
 
+func candidates(cert *x509.Certificate, chain []*x509.Certificate) []*x509.Certificate {
+	if cert == nil {
+		return nil
+	}
+	out := make([]*x509.Certificate, 0, 1+len(chain))
+	out = append(out, cert)
+	for _, c := range chain {
+		if c != nil {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func rank(by string) int {
 	switch by {
 	case ByCertificate:
 		return 0
-	case BySKI:
+	case ByPublicKey:
 		return 1
-	default:
+	case BySKI:
 		return 2
+	default:
+		return 3
 	}
 }
 
-// matches reports whether and how the service's digital identity covers c.
-func (s *Service) matches(c *x509.Certificate) (string, bool) {
-	for _, raw := range s.rawCertificates {
-		if bytes.Equal(raw, c.Raw) {
-			return ByCertificate, true
-		}
-	}
-	if ski := keyIdentifier(c); len(ski) > 0 {
-		for _, want := range s.SKIs {
-			if bytes.Equal(want, ski) {
-				return BySKI, true
-			}
-		}
-	}
-	if len(s.SubjectNames) > 0 {
-		have := subjectAttributes(c.Subject)
-		for _, name := range s.SubjectNames {
-			if want, err := parseDN(name); err == nil && equalAttributes(want, have) {
-				return BySubject, true
-			}
-		}
-	}
-	return "", false
-}
-
-// keyIdentifier returns the certificate's subject key identifier, deriving
-// it from the public key (RFC 5280 §4.2.1.2 method 1) when the extension is
-// absent, which is how trusted lists compute X509SKI for such certificates.
-func keyIdentifier(c *x509.Certificate) []byte {
-	if len(c.SubjectKeyId) > 0 {
-		return c.SubjectKeyId
-	}
+// publicKeyIdentifier returns the SHA-1 of the certificate's subjectPublicKey
+// bits (RFC 5280 §4.2.1.2 method 1), which is how trusted lists compute
+// X509SKI. The SubjectKeyId extension the certificate asserts is
+// deliberately not used: it is chosen by the certificate's issuer and would
+// let any CA the verifier trusts mint a certificate that matches a listed key
+// identifier.
+func publicKeyIdentifier(c *x509.Certificate) []byte {
 	var spki struct {
 		Algorithm pkix.AlgorithmIdentifier
 		PublicKey asn1.BitString
@@ -252,7 +393,7 @@ func keyIdentifier(c *x509.Certificate) []byte {
 	if _, err := asn1.Unmarshal(c.RawSubjectPublicKeyInfo, &spki); err != nil {
 		return nil
 	}
-	sum := sha1.Sum(spki.PublicKey.Bytes) //nolint:gosec // see keyIdentifier doc.
+	sum := sha1.Sum(spki.PublicKey.Bytes) //nolint:gosec // see publicKeyIdentifier doc.
 	return sum[:]
 }
 
@@ -372,7 +513,7 @@ func parseDN(s string) ([]attribute, error) {
 		return nil, err
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("eutl: empty distinguished name")
+		return nil, errors.New("eutl: empty distinguished name")
 	}
 	sortAttributes(out)
 	return out, nil

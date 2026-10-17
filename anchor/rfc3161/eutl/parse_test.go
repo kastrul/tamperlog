@@ -1,6 +1,9 @@
 package eutl
 
 import (
+	"bytes"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -60,8 +63,8 @@ func TestParseTL(t *testing.T) {
 	if !tl.ListIssueDateTime.Equal(date(2026, 9, 1).Add(9*time.Hour)) || !tl.NextUpdate.Equal(date(2027, 3, 1).Add(9*time.Hour)) {
 		t.Fatalf("issue/next = %v/%v", tl.ListIssueDateTime, tl.NextUpdate)
 	}
-	if len(tl.Services) != 3 {
-		t.Fatalf("services = %d, want 3", len(tl.Services))
+	if len(tl.Services) != 4 {
+		t.Fatalf("services = %d, want 4", len(tl.Services))
 	}
 	ca, _ := testCA(t)
 
@@ -69,11 +72,8 @@ func TestParseTL(t *testing.T) {
 	if q.Provider != "Example Qualified Services AS" || q.Name != "Example Qualified TSA" || q.Type != TypeQTST || q.Territory != "EE" {
 		t.Fatalf("service 0 = %+v", q)
 	}
-	if len(q.Certificates) != 1 || !q.Certificates[0].Equal(ca) {
-		t.Fatalf("service 0 certificates = %d", len(q.Certificates))
-	}
-	if len(q.SubjectNames) != 1 {
-		t.Fatalf("service 0 subject names = %v (history identities must be merged and deduplicated)", q.SubjectNames)
+	if len(q.Problems) != 0 {
+		t.Fatalf("service 0 problems = %v", q.Problems)
 	}
 	wantHistory := []StatusPeriod{
 		{Status: "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/undersupervision", Type: TypeTSA, From: date(2016, 1, 15)},
@@ -88,9 +88,21 @@ func TestParseTL(t *testing.T) {
 			t.Errorf("history[%d] = %+v, want %+v", i, q.History[i], wantHistory[i])
 		}
 	}
+	// Identities stay with their period: the certificate is in the current
+	// ServiceInformation only, the history instances name the subject.
+	cur := q.Current()
+	if !cur.From.Equal(date(2030, 1, 1)) || len(cur.Identity.Certificates) != 1 || !cur.Identity.Certificates[0].Equal(ca) || len(cur.Identity.SubjectNames) != 1 {
+		t.Fatalf("current identity = %+v", cur.Identity)
+	}
+	for i := range 2 {
+		id := q.History[i].Identity
+		if len(id.Certificates) != 0 || len(id.SKIs) != 0 || len(id.SubjectNames) != 1 || id.SubjectNames[0] != cur.Identity.SubjectNames[0] {
+			t.Fatalf("history[%d] identity = %+v", i, id)
+		}
+	}
 
 	legacy := tl.Services[1]
-	if legacy.Type != TypeTSA || legacy.Name != "Example Legacy TSA" || len(legacy.SubjectNames) != 1 || len(legacy.Certificates) != 0 {
+	if legacy.Type != TypeTSA || legacy.Name != "Example Legacy TSA" || len(legacy.Current().Identity.SubjectNames) != 1 || len(legacy.Current().Identity.Certificates) != 0 {
 		t.Fatalf("service 1 = %+v", legacy)
 	}
 
@@ -98,8 +110,35 @@ func TestParseTL(t *testing.T) {
 	if ski.Provider != "Näidis Ajatemplid OÜ" {
 		t.Fatalf("service 2 provider = %q (first name when no English)", ski.Provider)
 	}
-	if len(ski.SKIs) != 1 || string(ski.SKIs[0]) != "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14" {
-		t.Fatalf("service 2 SKIs = %x", ski.SKIs)
+	wantSKI, err := base64.StdEncoding.DecodeString("+cYWqpqOZSjF5qYXC07mLhBzOVg=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ski.Current().Identity.SKIs; len(got) != 1 || !bytes.Equal(got[0], wantSKI) {
+		t.Fatalf("service 2 SKIs = %x", got)
+	}
+
+	rot := tl.Services[3]
+	old, cur2 := loadCert(t, "rotated-old.pem"), loadCert(t, "rotated-new.pem")
+	if rot.Name != "Example Rotating TSA" || len(rot.History) != 3 || len(rot.Problems) != 0 {
+		t.Fatalf("service 3 = %+v", rot)
+	}
+	for i, want := range []struct {
+		status string
+		from   time.Time
+		cert   *x509.Certificate
+	}{
+		{StatusGranted, date(2018, 1, 1), old},
+		{StatusWithdrawn, date(2021, 1, 1), old},
+		{StatusGranted, date(2022, 1, 1), cur2},
+	} {
+		p := rot.History[i]
+		if p.Status != want.status || !p.From.Equal(want.from) || len(p.Identity.Certificates) != 1 || !p.Identity.Certificates[0].Equal(want.cert) {
+			t.Errorf("service 3 history[%d] = %+v", i, p)
+		}
+	}
+	if id := rot.Current().Identity; len(id.SKIs) != 1 || len(id.SubjectNames) != 1 {
+		t.Fatalf("service 3 current identity = %+v", id)
 	}
 }
 
@@ -172,7 +211,7 @@ func TestParseToleratesUnknownElements(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tl.Services) != 3 {
+	if len(tl.Services) != 4 {
 		t.Fatalf("services = %d", len(tl.Services))
 	}
 }

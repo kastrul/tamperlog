@@ -10,6 +10,14 @@
 // [List.Qualified] evaluates a certificate against them, feeding
 // anchor.Attestation.Qualified.
 //
+// Matching is per status period: a certificate qualifies only when the
+// digital identity listed for the period that contains the time-stamp's time
+// authenticates it by key (exact certificate, public key, or an X509SKI equal
+// to the SHA-1 of its public key); subject names never suffice. [Checker]
+// takes a [Policy] that can refuse lists past their NextUpdate or missing
+// territories, and [Loader.LoadWithRefresh] keeps a list current for
+// long-running processes.
+//
 // Trust model: this package verifies TLS to the publishing hosts, not the
 // XAdES signature on each list. See docs/anchors/eutl.md for the caveat and
 // the available mitigations ([WithPinnedLOTLSHA256], [WithOffline], and the

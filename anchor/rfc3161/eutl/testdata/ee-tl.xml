@@ -137,12 +137,71 @@
                         </ServiceName>
                         <ServiceDigitalIdentity>
                             <DigitalId>
-                                <X509SKI>AQIDBAUGBwgJCgsMDQ4PEBESExQ=</X509SKI>
+                                <X509SKI>+cYWqpqOZSjF5qYXC07mLhBzOVg=</X509SKI>
                             </DigitalId>
                         </ServiceDigitalIdentity>
                         <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted</ServiceStatus>
                         <StatusStartingTime>2020-03-01T00:00:00Z</StatusStartingTime>
                     </ServiceInformation>
+                </TSPService>
+            </TSPServices>
+        </TrustServiceProvider>
+        <TrustServiceProvider>
+            <TSPInformation>
+                <TSPName>
+                    <Name xml:lang="en">Example Rotating TSA OÜ</Name>
+                </TSPName>
+            </TSPInformation>
+            <TSPServices>
+                <TSPService>
+                    <ServiceInformation>
+                        <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST</ServiceTypeIdentifier>
+                        <ServiceName>
+                            <Name xml:lang="en">Example Rotating TSA</Name>
+                        </ServiceName>
+                        <ServiceDigitalIdentity>
+                            <DigitalId>
+                                <X509Certificate>MIIBzjCCAXWgAwIBAgIBZjAKBggqhkjOPQQDAjBXMQswCQYDVQQGEwJFRTEhMB8GA1UECgwYRXhhbXBsZSBSb3RhdGluZyBUU0EgT8OcMSUwIwYDVQQDExxFeGFtcGxlIFJvdGF0aW5nIFRTQSBDQSAyMDIyMB4XDTE3MDEwMTAwMDAwMFoXDTQ3MDEwMTAwMDAwMFowVzELMAkGA1UEBhMCRUUxITAfBgNVBAoMGEV4YW1wbGUgUm90YXRpbmcgVFNBIE/DnDElMCMGA1UEAxMcRXhhbXBsZSBSb3RhdGluZyBUU0EgQ0EgMjAyMjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABIoYx53ODskpzoN7komJs7aQibqIm0sKlv4RJvx/9pVpSw9Aob13sEGRwgiOBwEONfzbOTJm6jKWrFcshiUpJWOjMjAwMA4GA1UdDwEB/wQEAwIChDAPBgNVHRMBAf8EBTADAQH/MA0GA1UdDgQGBASiAQIDMAoGCCqGSM49BAMCA0cAMEQCIDbYWUEPPXiQHk+YuHJWoX6IF5EOINFCM9GKnkYwvOaQAiBvBYLeJvlA3qka6anlQ+yW4/7GdS0sqiJpZyXDpOAkJA==</X509Certificate>
+                            </DigitalId>
+                            <DigitalId>
+                                <!-- Stale: the key identifier of the retired 2018 CA, left next to the 2022 certificate. -->
+                                <X509SKI>HUhKItnG49MSPMiyN5z/NmN9YYA=</X509SKI>
+                            </DigitalId>
+                            <DigitalId>
+                                <X509SubjectName>CN=Example Rotating TSA CA 2022, O=Example Rotating TSA OÜ, C=EE</X509SubjectName>
+                            </DigitalId>
+                        </ServiceDigitalIdentity>
+                        <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted</ServiceStatus>
+                        <StatusStartingTime>2022-01-01T00:00:00Z</StatusStartingTime>
+                    </ServiceInformation>
+                    <ServiceHistory>
+                        <ServiceHistoryInstance>
+                            <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST</ServiceTypeIdentifier>
+                            <ServiceName>
+                                <Name xml:lang="en">Example Rotating TSA</Name>
+                            </ServiceName>
+                            <ServiceDigitalIdentity>
+                                <DigitalId>
+                                    <X509Certificate>MIIBzjCCAXWgAwIBAgIBZTAKBggqhkjOPQQDAjBXMQswCQYDVQQGEwJFRTEhMB8GA1UECgwYRXhhbXBsZSBSb3RhdGluZyBUU0EgT8OcMSUwIwYDVQQDExxFeGFtcGxlIFJvdGF0aW5nIFRTQSBDQSAyMDE4MB4XDTE3MDEwMTAwMDAwMFoXDTQ3MDEwMTAwMDAwMFowVzELMAkGA1UEBhMCRUUxITAfBgNVBAoMGEV4YW1wbGUgUm90YXRpbmcgVFNBIE/DnDElMCMGA1UEAxMcRXhhbXBsZSBSb3RhdGluZyBUU0EgQ0EgMjAxODBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKUW1sHvTxTBOlUcw/fJvjRRNUPpG9Kdxd25p6jSBCL+rBxjAn4J2wdn1OnxrwHS4c8Zdu/xW5hR+LDVOgbLKUSjMjAwMA4GA1UdDwEB/wQEAwIChDAPBgNVHRMBAf8EBTADAQH/MA0GA1UdDgQGBAShAQIDMAoGCCqGSM49BAMCA0cAMEQCIBLlMmr0/OdHVxoT2B8sbQIHqEEJW8vPXc27g5yEzhC5AiASOENmUQZ7vqbPoZBbhsH/OlsK0BDETLm6of2jteo56w==</X509Certificate>
+                                </DigitalId>
+                            </ServiceDigitalIdentity>
+                            <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn</ServiceStatus>
+                            <StatusStartingTime>2021-01-01T00:00:00Z</StatusStartingTime>
+                        </ServiceHistoryInstance>
+                        <ServiceHistoryInstance>
+                            <ServiceTypeIdentifier>http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST</ServiceTypeIdentifier>
+                            <ServiceName>
+                                <Name xml:lang="en">Example Rotating TSA</Name>
+                            </ServiceName>
+                            <ServiceDigitalIdentity>
+                                <DigitalId>
+                                    <X509Certificate>MIIBzjCCAXWgAwIBAgIBZTAKBggqhkjOPQQDAjBXMQswCQYDVQQGEwJFRTEhMB8GA1UECgwYRXhhbXBsZSBSb3RhdGluZyBUU0EgT8OcMSUwIwYDVQQDExxFeGFtcGxlIFJvdGF0aW5nIFRTQSBDQSAyMDE4MB4XDTE3MDEwMTAwMDAwMFoXDTQ3MDEwMTAwMDAwMFowVzELMAkGA1UEBhMCRUUxITAfBgNVBAoMGEV4YW1wbGUgUm90YXRpbmcgVFNBIE/DnDElMCMGA1UEAxMcRXhhbXBsZSBSb3RhdGluZyBUU0EgQ0EgMjAxODBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKUW1sHvTxTBOlUcw/fJvjRRNUPpG9Kdxd25p6jSBCL+rBxjAn4J2wdn1OnxrwHS4c8Zdu/xW5hR+LDVOgbLKUSjMjAwMA4GA1UdDwEB/wQEAwIChDAPBgNVHRMBAf8EBTADAQH/MA0GA1UdDgQGBAShAQIDMAoGCCqGSM49BAMCA0cAMEQCIBLlMmr0/OdHVxoT2B8sbQIHqEEJW8vPXc27g5yEzhC5AiASOENmUQZ7vqbPoZBbhsH/OlsK0BDETLm6of2jteo56w==</X509Certificate>
+                                </DigitalId>
+                            </ServiceDigitalIdentity>
+                            <ServiceStatus>http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted</ServiceStatus>
+                            <StatusStartingTime>2018-01-01T00:00:00Z</StatusStartingTime>
+                        </ServiceHistoryInstance>
+                    </ServiceHistory>
                 </TSPService>
             </TSPServices>
         </TrustServiceProvider>

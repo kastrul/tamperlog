@@ -291,73 +291,88 @@ func parseService(territory, provider string, x *xmlService) (*Service, error) {
 	if svc.Type == "" {
 		return nil, errors.New("missing ServiceTypeIdentifier")
 	}
-	seen := map[string]bool{}
-	addIdentity := func(id *xmlDigitalIdentity) error {
-		for _, d := range id.IDs {
-			switch {
-			case d.Certificate != "":
-				raw, err := decodeBase64(d.Certificate)
-				if err != nil {
-					return fmt.Errorf("X509Certificate: %w", err)
-				}
-				if !seen["c:"+string(raw)] {
-					seen["c:"+string(raw)] = true
-					svc.rawCertificates = append(svc.rawCertificates, raw)
-					if c, err := x509.ParseCertificate(raw); err == nil {
-						svc.Certificates = append(svc.Certificates, c)
-					}
-				}
-			case d.SKI != "":
-				ski, err := decodeBase64(d.SKI)
-				if err != nil {
-					return fmt.Errorf("X509SKI: %w", err)
-				}
-				if !seen["s:"+string(ski)] {
-					seen["s:"+string(ski)] = true
-					svc.SKIs = append(svc.SKIs, ski)
-				}
-			case d.SubjectName != "":
-				name := strings.TrimSpace(d.SubjectName)
-				if !seen["n:"+name] {
-					seen["n:"+name] = true
-					svc.SubjectNames = append(svc.SubjectNames, name)
-				}
-			}
-		}
-		return nil
-	}
-	period := func(si *xmlServiceInformation) (StatusPeriod, error) {
-		status := strings.TrimSpace(si.Status)
-		if status == "" {
-			return StatusPeriod{}, errors.New("missing ServiceStatus")
-		}
-		from, err := parseTime(si.StatusFrom)
-		if err != nil {
-			return StatusPeriod{}, fmt.Errorf("StatusStartingTime: %w", err)
-		}
-		return StatusPeriod{Status: status, Type: strings.TrimSpace(si.Type), From: from}, nil
-	}
-	if err := addIdentity(&info.Identity); err != nil {
-		return nil, err
-	}
-	cur, err := period(info)
+	cur, err := parsePeriod(info)
 	if err != nil {
 		return nil, err
 	}
-	svc.History = append(svc.History, cur)
+	periods := make([]StatusPeriod, 0, 1+len(x.History))
+	periods = append(periods, cur)
 	for i := range x.History {
-		h := &x.History[i]
-		if err := addIdentity(&h.Identity); err != nil {
-			return nil, fmt.Errorf("history %d: %w", i, err)
-		}
-		p, err := period(h)
+		p, err := parsePeriod(&x.History[i])
 		if err != nil {
 			return nil, fmt.Errorf("history %d: %w", i, err)
 		}
-		svc.History = append(svc.History, p)
+		periods = append(periods, p)
 	}
-	sort.SliceStable(svc.History, func(i, j int) bool { return svc.History[i].From.Before(svc.History[j].From) })
+	// Lists write history newest-first; order ascending so that the period
+	// in force at t is the last one starting at or before t.
+	sort.SliceStable(periods, func(i, j int) bool { return periods[i].From.Before(periods[j].From) })
+	for i := 1; i < len(periods); i++ {
+		if periods[i].From.Equal(periods[i-1].From) {
+			svc.Problems = append(svc.Problems, "two status periods start at "+periods[i].From.Format(time.RFC3339))
+		}
+	}
+	if last := periods[len(periods)-1]; last.From.After(cur.From) {
+		svc.Problems = append(svc.Problems, fmt.Sprintf("history instance starting %s is later than the current status (%s)",
+			last.From.Format(time.RFC3339), cur.From.Format(time.RFC3339)))
+	}
+	svc.History = periods
 	return svc, nil
+}
+
+// parsePeriod reads one ServiceInformation or ServiceHistoryInstance with
+// the digital identity that belongs to it.
+func parsePeriod(si *xmlServiceInformation) (StatusPeriod, error) {
+	status := strings.TrimSpace(si.Status)
+	if status == "" {
+		return StatusPeriod{}, errors.New("missing ServiceStatus")
+	}
+	from, err := parseTime(si.StatusFrom)
+	if err != nil {
+		return StatusPeriod{}, fmt.Errorf("StatusStartingTime: %w", err)
+	}
+	id, err := parseIdentity(&si.Identity)
+	if err != nil {
+		return StatusPeriod{}, err
+	}
+	return StatusPeriod{Status: status, Type: strings.TrimSpace(si.Type), From: from, Identity: id}, nil
+}
+
+func parseIdentity(x *xmlDigitalIdentity) (Identity, error) {
+	var id Identity
+	seen := map[string]bool{}
+	for _, d := range x.IDs {
+		switch {
+		case d.Certificate != "":
+			raw, err := decodeBase64(d.Certificate)
+			if err != nil {
+				return Identity{}, fmt.Errorf("X509Certificate: %w", err)
+			}
+			if !seen["c:"+string(raw)] {
+				seen["c:"+string(raw)] = true
+				id.rawCertificates = append(id.rawCertificates, raw)
+				if c, err := x509.ParseCertificate(raw); err == nil {
+					id.Certificates = append(id.Certificates, c)
+				}
+			}
+		case d.SKI != "":
+			ski, err := decodeBase64(d.SKI)
+			if err != nil {
+				return Identity{}, fmt.Errorf("X509SKI: %w", err)
+			}
+			if !seen["s:"+string(ski)] {
+				seen["s:"+string(ski)] = true
+				id.SKIs = append(id.SKIs, ski)
+			}
+		case d.SubjectName != "":
+			name := strings.TrimSpace(d.SubjectName)
+			if !seen["n:"+name] {
+				seen["n:"+name] = true
+				id.SubjectNames = append(id.SubjectNames, name)
+			}
+		}
+	}
+	return id, nil
 }
 
 // pickName prefers the English name, then the first one given.

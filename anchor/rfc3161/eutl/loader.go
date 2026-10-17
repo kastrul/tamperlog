@@ -37,13 +37,21 @@ var (
 	ErrInsecureURL = errors.New("eutl: list location is not https")
 	// ErrBodyTooLarge means a list exceeded [MaxBodySize].
 	ErrBodyTooLarge = errors.New("eutl: list body exceeds size limit")
+	// ErrTooManyRedirects means a download followed more than [MaxRedirects].
+	ErrTooManyRedirects = errors.New("eutl: too many redirects")
 )
+
+// MaxRedirects bounds the redirect hops the loader follows for one list;
+// every hop must stay on https.
+const MaxRedirects = 5
 
 // Option configures a [Loader].
 type Option func(*Loader)
 
 // WithHTTPClient sets the HTTP client; the default is a client with a
-// 60-second timeout.
+// 60-second timeout. The loader uses a copy whose CheckRedirect refuses
+// any hop to a non-https URL and more than [MaxRedirects] hops, calling the
+// client's own CheckRedirect, if any, afterwards.
 func WithHTTPClient(c *http.Client) Option {
 	return func(l *Loader) { l.client = c }
 }
@@ -127,7 +135,33 @@ func NewLoader(opts ...Option) *Loader {
 	for _, o := range opts {
 		o(l)
 	}
+	l.client = httpsOnlyClient(l.client)
 	return l
+}
+
+// httpsOnlyClient returns a copy of c that refuses redirects leaving https
+// and more than [MaxRedirects] hops. Checking only the initial URL would let
+// a publisher (or anyone who can answer for it) bounce the download to a
+// plaintext location.
+func httpsOnlyClient(c *http.Client) *http.Client {
+	if c == nil {
+		c = &http.Client{Timeout: 60 * time.Second}
+	}
+	cc := *c
+	inner := c.CheckRedirect
+	cc.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= MaxRedirects {
+			return fmt.Errorf("%w: stopped after %d hops at %s", ErrTooManyRedirects, len(via), req.URL.Redacted())
+		}
+		if req.URL.Scheme != "https" {
+			return fmt.Errorf("%w: redirected to %s", ErrInsecureURL, req.URL.Redacted())
+		}
+		if inner != nil {
+			return inner(req, via)
+		}
+		return nil
+	}
+	return &cc
 }
 
 // Load fetches the LOTL and then, concurrently, every national XML list it
@@ -154,10 +188,12 @@ func (l *Loader) Load(ctx context.Context) (*List, error) {
 	}
 
 	out := &List{
-		LOTL:     lotl,
-		Lists:    map[string]*TL{},
-		Errors:   map[string]error{},
-		LoadedAt: l.now().UTC(),
+		LOTL:       lotl,
+		IssuedAt:   lotl.ListIssueDateTime,
+		NextUpdate: lotl.NextUpdate,
+		Lists:      map[string]*TL{},
+		Errors:     map[string]error{},
+		LoadedAt:   l.now().UTC(),
 	}
 	var (
 		mu  sync.Mutex

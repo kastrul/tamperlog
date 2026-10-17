@@ -138,8 +138,12 @@ tamperlog verify  --bundle /tmp/bundle --tsa-roots sk-test-tsa-ca.pem --no-sinks
 tamperlog inspect token /srv/seals/seals/000000000001.rfc3161.proof
 ```
 
-`verify` refuses to run unless every external layer is either configured or
-explicitly skipped (`--tsa-roots` or `--no-anchors`; a sink or `--no-sinks`;
+With `--s3-bucket` every command first runs the bucket preflight and prints
+whether the bucket is adequate for the administrator threat model (Object
+Lock on, versioning enabled, COMPLIANCE mode, a conclusive delete probe when
+`--s3-probe-key` is given); `--eutl-cache` enables qualified-status checks
+with fresh trusted lists required. `verify` refuses to run unless every
+external layer is either configured or explicitly skipped (`--tsa-roots` or `--no-anchors`; a sink or `--no-sinks`;
 `--max-seal-age` or `--no-freshness`), and prints the scope it ran with. It
 exits 0 when every check passes, 1 when a finding has severity error, 2 when
 the evidence could not be read (source or sink errors) or the configuration is

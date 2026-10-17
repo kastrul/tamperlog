@@ -38,7 +38,7 @@ func TestLiveEstonianList(t *testing.T) {
 		found++
 		cur := s.History[len(s.History)-1]
 		t.Logf("EE QTST: provider %q service %q status %s since %s (%d certificates, %d periods)",
-			s.Provider, s.Name, cur.Status, cur.From.Format(time.DateOnly), len(s.Certificates), len(s.History))
+			s.Provider, s.Name, cur.Status, cur.From.Format(time.DateOnly), len(cur.Identity.Certificates), len(s.History))
 	}
 	if found == 0 {
 		t.Fatal("no QTST service on the Estonian list")
