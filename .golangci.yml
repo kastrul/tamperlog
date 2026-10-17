@@ -47,7 +47,7 @@ linters:
     revive:
       rules:
         - name: exported
-          arguments: ["checkPrivateReceivers", "sayRepetitiveInsteadOfStutters"]
+          arguments: ["sayRepetitiveInsteadOfStutters"]
         - name: package-comments
         - name: unexported-return
         - name: errorf
