@@ -7,6 +7,8 @@
 -- trigger) is detected by seals and anchors, not here. See
 -- docs/backends/postgres.md.
 
+CREATE SCHEMA IF NOT EXISTS __SCHEMA__;
+
 CREATE TABLE IF NOT EXISTS __SCHEMA__.tamperlog_schema (
   version    integer     PRIMARY KEY,
   applied_at timestamptz NOT NULL DEFAULT now()
