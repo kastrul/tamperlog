@@ -169,6 +169,10 @@ func DropDigest(h Hasher, stream string, firstSeq int64, firstPrevHash []byte, l
 	return d.Sum(nil)
 }
 
+// DropAction is the action of the system-stream event that records a
+// retention drop (see [DropEvent]).
+const DropAction = "retention.drop"
+
 // DropEvent returns the system-stream event that records a retention drop of
 // stream's records firstSeq..lastSeq, with [DropDigest] as its PayloadHash and
 // the range in attributes. Append it in the same transaction as the drop,
@@ -176,7 +180,7 @@ func DropDigest(h Hasher, stream string, firstSeq int64, firstPrevHash []byte, l
 func DropEvent(h Hasher, systemStream, stream string, firstSeq int64, firstPrevHash []byte, lastSeq int64, lastHash []byte) Event {
 	return Event{
 		Stream:      systemStream,
-		Action:      "retention.drop",
+		Action:      DropAction,
 		Entity:      "stream",
 		EntityID:    stream,
 		PayloadHash: DropDigest(h, stream, firstSeq, firstPrevHash, lastSeq, lastHash),

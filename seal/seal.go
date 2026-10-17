@@ -97,7 +97,11 @@ var ErrInvalid = errors.New("seal: invalid")
 // 32 to 64 bytes, a non-empty writer, and signature and key_id present
 // together. Comparison with the previous seal and with the live chain is the
 // verifier's job.
-func (s *Seal) Validate() error {
+func (s *Seal) Validate() error { return s.validate(false) }
+
+// validate is Validate; forSigning allows KeyID without Signature, the state
+// of a document while its signature is being computed.
+func (s *Seal) validate(forSigning bool) error {
 	fail := func(format string, a ...any) error {
 		return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, a...))
 	}
@@ -141,7 +145,10 @@ func (s *Seal) Validate() error {
 	if s.Writer == "" || len(s.Writer) > 255 {
 		return fail("writer missing or too long")
 	}
-	if (s.KeyID == "") != (len(s.Signature) == 0) {
+	switch {
+	case forSigning && s.KeyID == "":
+		return fail("signing requires a key_id")
+	case !forSigning && (s.KeyID == "") != (len(s.Signature) == 0):
 		return fail("key_id and signature must be present together")
 	}
 	return nil
@@ -156,7 +163,7 @@ func (s *Seal) Canonical() ([]byte, error) { return s.canonical(true) }
 func (s *Seal) SigningBytes() ([]byte, error) { return s.canonical(false) }
 
 func (s *Seal) canonical(withSignature bool) ([]byte, error) {
-	if err := s.Validate(); err != nil {
+	if err := s.validate(!withSignature); err != nil {
 		return nil, err
 	}
 	streams := make([]any, len(s.Streams))
