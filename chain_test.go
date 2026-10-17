@@ -277,6 +277,17 @@ func TestCommitAndDropDigest(t *testing.T) {
 	if err := ev.Validate(32); err != nil {
 		t.Fatal(err)
 	}
+	parsed, ok, err := tamperlog.ParseDrop(tamperlog.SHA256, tamperlog.Record{Event: ev})
+	if err != nil || !ok || parsed.Stream != "s" || parsed.FirstSeq != 1 || parsed.LastSeq != 10 || !bytes.Equal(parsed.LastHash, bytes.Repeat([]byte{1}, 32)) || !bytes.Equal(parsed.Digest, d) {
+		t.Fatalf("ParseDrop = %+v, %v, %v", parsed, ok, err)
+	}
+	ev.Attributes["last_seq"] = "11"
+	if _, _, err := tamperlog.ParseDrop(tamperlog.SHA256, tamperlog.Record{Event: ev}); err == nil {
+		t.Fatal("tampered drop attributes accepted")
+	}
+	if _, ok, _ := tamperlog.ParseDrop(tamperlog.SHA256, tamperlog.Record{Event: tamperlog.Event{Action: "other"}}); ok {
+		t.Fatal("non-drop event parsed as drop")
+	}
 }
 
 type edit struct {

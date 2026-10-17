@@ -3,7 +3,9 @@ package tamperlog
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -173,10 +175,21 @@ func DropDigest(h Hasher, stream string, firstSeq int64, firstPrevHash []byte, l
 // retention drop (see [DropEvent]).
 const DropAction = "retention.drop"
 
+// Attribute keys of a [DropEvent]. The edge hashes are recorded so a
+// verifier can bridge a gap made of several consecutive drops, where the
+// hashes between drops are no longer available.
+const (
+	DropAttrFirstSeq      = "first_seq"
+	DropAttrFirstPrevHash = "first_prev_hash"
+	DropAttrLastSeq       = "last_seq"
+	DropAttrLastHash      = "last_hash"
+)
+
 // DropEvent returns the system-stream event that records a retention drop of
 // stream's records firstSeq..lastSeq, with [DropDigest] as its PayloadHash and
-// the range in attributes. Append it in the same transaction as the drop,
-// before the drop, so a failed drop leaves no orphan event.
+// the range and edge hashes in attributes. Append it in the same transaction
+// as the drop, before the drop, so a failed drop leaves no orphan event. A
+// stream's newest record must never be dropped.
 func DropEvent(h Hasher, systemStream, stream string, firstSeq int64, firstPrevHash []byte, lastSeq int64, lastHash []byte) Event {
 	return Event{
 		Stream:      systemStream,
@@ -185,8 +198,50 @@ func DropEvent(h Hasher, systemStream, stream string, firstSeq int64, firstPrevH
 		EntityID:    stream,
 		PayloadHash: DropDigest(h, stream, firstSeq, firstPrevHash, lastSeq, lastHash),
 		Attributes: map[string]string{
-			"first_seq": fmt.Sprint(firstSeq),
-			"last_seq":  fmt.Sprint(lastSeq),
+			DropAttrFirstSeq:      strconv.FormatInt(firstSeq, 10),
+			DropAttrFirstPrevHash: hex.EncodeToString(firstPrevHash),
+			DropAttrLastSeq:       strconv.FormatInt(lastSeq, 10),
+			DropAttrLastHash:      hex.EncodeToString(lastHash),
 		},
 	}
+}
+
+// Drop is a retention drop as recorded by a [DropEvent].
+type Drop struct {
+	Stream        string
+	FirstSeq      int64
+	FirstPrevHash []byte
+	LastSeq       int64
+	LastHash      []byte
+	Digest        []byte // the event's PayloadHash
+}
+
+// ParseDrop reads a drop event back. It returns false when r is not a drop
+// event and an error when it is malformed or its PayloadHash does not equal
+// the digest recomputed from its attributes under h.
+func ParseDrop(h Hasher, r Record) (Drop, bool, error) {
+	if r.Action != DropAction {
+		return Drop{}, false, nil
+	}
+	d := Drop{Stream: r.EntityID, Digest: r.PayloadHash}
+	var err error
+	if d.FirstSeq, err = strconv.ParseInt(r.Attributes[DropAttrFirstSeq], 10, 64); err != nil {
+		return Drop{}, true, fmt.Errorf("tamperlog: drop event %s/%d: first_seq: %w", r.Stream, r.Seq, err)
+	}
+	if d.LastSeq, err = strconv.ParseInt(r.Attributes[DropAttrLastSeq], 10, 64); err != nil {
+		return Drop{}, true, fmt.Errorf("tamperlog: drop event %s/%d: last_seq: %w", r.Stream, r.Seq, err)
+	}
+	if d.FirstPrevHash, err = hex.DecodeString(r.Attributes[DropAttrFirstPrevHash]); err != nil {
+		return Drop{}, true, fmt.Errorf("tamperlog: drop event %s/%d: first_prev_hash: %w", r.Stream, r.Seq, err)
+	}
+	if d.LastHash, err = hex.DecodeString(r.Attributes[DropAttrLastHash]); err != nil {
+		return Drop{}, true, fmt.Errorf("tamperlog: drop event %s/%d: last_hash: %w", r.Stream, r.Seq, err)
+	}
+	if d.FirstSeq < 1 || d.LastSeq < d.FirstSeq {
+		return Drop{}, true, fmt.Errorf("tamperlog: drop event %s/%d: range %d..%d", r.Stream, r.Seq, d.FirstSeq, d.LastSeq)
+	}
+	if want := DropDigest(h, d.Stream, d.FirstSeq, d.FirstPrevHash, d.LastSeq, d.LastHash); !bytes.Equal(want, d.Digest) {
+		return Drop{}, true, fmt.Errorf("tamperlog: drop event %s/%d: payload hash does not match its attributes", r.Stream, r.Seq)
+	}
+	return d, true, nil
 }
