@@ -16,6 +16,8 @@ const goldenBinaryV1 = "0000000463686174" + // stream "chat"
 	"000000076368616e6e656c" + "00000003776562" + // channel=web
 	"00000007707572706f7365" + "0000000974726561746d656e74" // purpose=treatment
 
+const goldenJCSV1 = `{"action":"message.read","actor":"0199f5a0-0000-7000-8000-000000000001","at":1791892800123456,"attributes":{"channel":"web","purpose":"treatment"},"entity":"chat_message","entity_id":"0199f5a0-0000-7000-8000-000000000002","payload_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":1,"stream":"chat","subject":""}`
+
 var goldenHashes = map[string]string{
 	"binary/v1 sha256":     "05442837467699a6f80ddecbe2411c1229d57eeeabdc31f14f4cab453df790a8",
 	"binary/v1 sha3-256":   "1a5631c53e73c04f3e1b6ebcaabf95ae78d1f2f2d14c2c7763cb692fcee8f177",

@@ -39,6 +39,11 @@ func Run(t *testing.T, newProvider Factory) {
 		"HeadsAndFirstSeqs":          testHeadsFirstSeqs,
 		"HeadClockAdvances":          testClock,
 		"InvalidStreamIsRefused":     testInvalidStream,
+		"HeadReportsAlgorithmsAndAt": testHeadAlgorithms,
+		"AlgorithmChangeIsRefused":   testAlgorithmMismatch,
+		"HeadWaitHonoursContext":     testHeadCancel,
+		"HeadsWhileAppending":        testHeadsConcurrent,
+		"ReadResultsAreCopies":       testCopies,
 		"SealsChainAndProofs":        testSeals,
 	}
 	for name, fn := range tests {
@@ -258,6 +263,148 @@ func testHeadLock(t *testing.T, p Provider) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("second Head still blocked after the first transaction ended")
+	}
+}
+
+func testHeadAlgorithms(t *testing.T, p Provider) {
+	c := ctx(t)
+	r, err := tamperlog.NewLog(p).Append(c, event("s", "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := p.Begin(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(c) //nolint:errcheck // cleanup
+	h, err := tx.Head(c, "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Seq != 1 || !bytes.Equal(h.Hash, r.Hash) || !h.At.Equal(r.At) || h.Encoder != "binary/v1" || h.Hasher != "sha256" {
+		t.Fatalf("head = %+v, record = %+v", h, r)
+	}
+	heads, err := p.Heads(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := heads["s"]; g.Encoder != "binary/v1" || g.Hasher != "sha256" || !g.At.Equal(r.At) {
+		t.Fatalf("Heads()[s] = %+v", g)
+	}
+	recs, err := tx.Range(c, "s", 1, 1)
+	if err != nil || len(recs) != 1 || recs[0].Encoder != "binary/v1" || recs[0].Hasher != "sha256" {
+		t.Fatalf("range = %+v, %v", recs, err)
+	}
+}
+
+func testAlgorithmMismatch(t *testing.T, p Provider) {
+	c := ctx(t)
+	if _, err := tamperlog.NewLog(p).Append(c, event("s", "a")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := tamperlog.NewLog(p, tamperlog.WithHasher(tamperlog.SHA3256)).Append(c, event("s", "b"))
+	if !errors.Is(err, tamperlog.ErrAlgorithmMismatch) {
+		t.Fatalf("append with another hasher: %v, want ErrAlgorithmMismatch", err)
+	}
+	// A different stream may use a different pair.
+	if _, err := tamperlog.NewLog(p, tamperlog.WithHasher(tamperlog.SHA3256)).Append(c, event("t", "b")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testHeadCancel(t *testing.T, p Provider) {
+	c := ctx(t)
+	tx1, err := p.Begin(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx1.Rollback(c) //nolint:errcheck // cleanup
+	if _, err := tx1.Head(c, "s"); err != nil {
+		t.Fatal(err)
+	}
+	c2, cancel := context.WithTimeout(c, 300*time.Millisecond)
+	defer cancel()
+	tx2, err := p.Begin(c2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx2.Rollback(c) //nolint:errcheck // cleanup
+	start := time.Now()
+	_, err = tx2.Head(c2, "s")
+	if err == nil {
+		t.Fatal("second Head succeeded while the stream was held")
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("Head did not return promptly after cancellation: %v", err)
+	}
+}
+
+func testHeadsConcurrent(t *testing.T, p Provider) {
+	c := ctx(t)
+	log := tamperlog.NewLog(p)
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if _, err := log.Append(c, event("s", fmt.Sprintf("a%d", i))); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	for range 20 {
+		if _, err := p.Heads(c); err != nil {
+			t.Error(err)
+		}
+		if _, err := p.FirstSeqs(c); err != nil {
+			t.Error(err)
+		}
+	}
+	close(done)
+	wg.Wait()
+}
+
+func testCopies(t *testing.T, p Provider) {
+	c := ctx(t)
+	r, err := tamperlog.NewLog(p).Append(c, event("s", "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := p.Begin(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(c) //nolint:errcheck // cleanup
+	recs, err := tx.Range(c, "s", 1, 1)
+	if err != nil || len(recs) != 1 {
+		t.Fatal(err)
+	}
+	recs[0].Hash[0] ^= 1
+	recs[0].Attributes["purpose"] = "changed"
+	again, err := tx.Range(c, "s", 1, 1)
+	if err != nil || !bytes.Equal(again[0].Hash, r.Hash) || again[0].Attributes["purpose"] != "test" {
+		t.Fatalf("mutation through a read result changed stored data: %+v, %v", again, err)
+	}
+	body := []byte(`{"seq":1}`)
+	if err := p.PutSeal(c, seal.Stored{Seq: 1, SealedAt: time.Now(), Hash: seal.Hash(body), Bytes: body}); err != nil {
+		t.Fatal(err)
+	}
+	last, _, err := p.LastSeal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last.Bytes[0] = 'X'
+	last.Hash[0] ^= 1
+	again2, _, err := p.LastSeal(c)
+	if err != nil || !bytes.Equal(again2.Bytes, body) || !bytes.Equal(again2.Hash, seal.Hash(body)) {
+		t.Fatalf("mutation through LastSeal changed stored seal: %+v, %v", again2, err)
 	}
 }
 

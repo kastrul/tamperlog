@@ -38,8 +38,11 @@ type binaryV1 struct{}
 func (binaryV1) ID() string { return "binary/v1" }
 
 func (binaryV1) Encode(r Record) ([]byte, error) {
-	if r.Seq < 0 {
-		return nil, fmt.Errorf("binary/v1: negative seq %d", r.Seq)
+	if r.Seq < 0 || r.Seq > MaxSeq {
+		return nil, fmt.Errorf("binary/v1: seq %d out of range", r.Seq)
+	}
+	if err := ValidateTime(r.At); err != nil {
+		return nil, fmt.Errorf("binary/v1: %w", err)
 	}
 	b := make([]byte, 0, 256)
 	b = appendField(b, []byte(r.Stream))

@@ -79,9 +79,14 @@ func WithLogger(l *slog.Logger) Option { return func(c *config) { c.logger = l }
 // WithHooks installs callbacks.
 func WithHooks(h Hooks) Option { return func(c *config) { c.hooks = h } }
 
-// ErrClockSkew is returned when a caller-supplied time is outside the allowed
-// bounds.
+// ErrClockSkew is returned when a record's time is outside the allowed
+// bounds: a caller-supplied time too far from the store clock, or any time
+// more than the time tolerance before the previous record.
 var ErrClockSkew = errors.New("tamperlog: timestamp outside tolerance")
+
+// ErrAlgorithmMismatch is returned when an appender's encoder or hasher
+// differs from the pair the stream was started with.
+var ErrAlgorithmMismatch = errors.New("tamperlog: stream uses another encoder or hasher")
 
 // Appender links events into streams through a [Store]. It holds no database
 // state and is safe for concurrent use.
@@ -124,15 +129,20 @@ func (a *Appender) Append(ctx context.Context, s Store, e Event) (Record, error)
 	prev := h.Hash
 	if h.Seq == 0 {
 		prev = a.cfg.chain.Genesis()
-	} else if len(prev) != a.cfg.chain.Hasher.Size() {
-		return Record{}, fmt.Errorf("tamperlog: head of %s has a %d-byte hash, want %d", e.Stream, len(prev), a.cfg.chain.Hasher.Size())
+	} else {
+		if len(prev) != a.cfg.chain.Hasher.Size() {
+			return Record{}, fmt.Errorf("tamperlog: head of %s has a %d-byte hash, want %d", e.Stream, len(prev), a.cfg.chain.Hasher.Size())
+		}
+		if h.Encoder != a.cfg.chain.Encoder.ID() || h.Hasher != a.cfg.chain.Hasher.ID() {
+			return Record{}, fmt.Errorf("%w: stream %s uses %s/%s, this appender %s/%s", ErrAlgorithmMismatch, e.Stream, h.Encoder, h.Hasher, a.cfg.chain.Encoder.ID(), a.cfg.chain.Hasher.ID())
+		}
 	}
 	at, err := a.stamp(e, h)
 	if err != nil {
 		a.cfg.logger.WarnContext(ctx, "tamperlog append refused", "stream", e.Stream, "err", err)
 		return Record{}, err
 	}
-	r := Record{Event: e, Seq: h.Seq + 1, At: at, PrevHash: prev}
+	r := Record{Event: e, Seq: h.Seq + 1, At: at, Encoder: a.cfg.chain.Encoder.ID(), Hasher: a.cfg.chain.Hasher.ID(), PrevHash: prev}
 	r.Time = time.Time{}
 	if r.Hash, err = a.cfg.chain.Link(r); err != nil {
 		return Record{}, fmt.Errorf("tamperlog: link %s/%d: %w", e.Stream, r.Seq, err)
@@ -148,22 +158,29 @@ func (a *Appender) Append(ctx context.Context, s Store, e Event) (Record, error)
 }
 
 // stamp decides the record's timestamp: the store clock, or the caller's time
-// when enabled and within bounds. The result is UTC at microsecond precision,
-// the precision every shipped backend stores.
+// when enabled and within the skew tolerance. Either way the time must not
+// precede the head's by more than the time tolerance. The result is UTC at
+// microsecond precision, the precision every shipped backend stores.
 func (a *Appender) stamp(e Event, h Head) (time.Time, error) {
 	if h.Now.IsZero() {
 		return time.Time{}, errors.New("tamperlog: store returned no clock")
 	}
 	now := h.Now.UTC().Truncate(time.Microsecond)
-	if !a.cfg.callerTime {
-		return now, nil
+	at := now
+	if a.cfg.callerTime {
+		if e.Time.IsZero() {
+			return time.Time{}, fmt.Errorf("%w: caller time enabled but Event.Time is zero", ErrClockSkew)
+		}
+		at = e.Time.UTC().Truncate(time.Microsecond)
+		if d := at.Sub(now); d > a.cfg.skew || d < -a.cfg.skew {
+			return time.Time{}, fmt.Errorf("%w: %s is %s from the store clock %s", ErrClockSkew, at.Format(time.RFC3339Nano), d, now.Format(time.RFC3339Nano))
+		}
 	}
-	if e.Time.IsZero() {
-		return time.Time{}, fmt.Errorf("%w: caller time enabled but Event.Time is zero", ErrClockSkew)
+	if h.Seq > 0 && at.Before(h.At.Add(-a.cfg.timeTol)) {
+		return time.Time{}, fmt.Errorf("%w: %s precedes the head's %s by more than %s", ErrClockSkew, at.Format(time.RFC3339Nano), h.At.Format(time.RFC3339Nano), a.cfg.timeTol)
 	}
-	at := e.Time.UTC().Truncate(time.Microsecond)
-	if d := at.Sub(now); d > a.cfg.skew || d < -a.cfg.skew {
-		return time.Time{}, fmt.Errorf("%w: %s is %s from the store clock %s", ErrClockSkew, at.Format(time.RFC3339Nano), d, now.Format(time.RFC3339Nano))
+	if err := ValidateTime(at); err != nil {
+		return time.Time{}, err
 	}
 	return at, nil
 }
@@ -194,13 +211,14 @@ func (l *Log) Append(ctx context.Context, e Event) (Record, error) {
 	if err != nil {
 		return Record{}, fmt.Errorf("tamperlog: begin: %w", err)
 	}
+	// Rollback after Commit is a no-op by contract; the deferred call also
+	// runs when a hook or encoder panics, so no stream lock leaks.
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // best-effort cleanup
 	r, err := l.a.Append(ctx, tx, e)
 	if err != nil {
-		_ = tx.Rollback(ctx)
 		return Record{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		_ = tx.Rollback(ctx)
 		return Record{}, fmt.Errorf("tamperlog: commit %s/%d: %w", r.Stream, r.Seq, err)
 	}
 	return r, nil

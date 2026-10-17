@@ -1,6 +1,6 @@
 # Local PostgreSQL for the integration tests:
-#   docker compose up -d
-#   export TAMPERLOG_PG_DSN=postgres://tamperlog:tamperlog@localhost:5432/tamperlog?sslmode=disable
+#   docker compose up -d            (host port: TAMPERLOG_PG_PORT, default 55433)
+#   export TAMPERLOG_PG_DSN=postgres://tamperlog:tamperlog@localhost:55433/tamperlog?sslmode=disable
 #   go test -race -tags integration ./...
 services:
   postgres:
@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: tamperlog
       POSTGRES_DB: tamperlog
     ports:
-      - "5432:5432"
+      - "${TAMPERLOG_PG_PORT:-55433}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tamperlog"]
       interval: 5s

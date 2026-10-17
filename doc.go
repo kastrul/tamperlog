@@ -11,12 +11,14 @@
 // carrying the next sequence number, the store's clock, the previous record's
 // hash and its own hash:
 //
-//	hash = H( "tamperlog/v1" ‖ encoderID ‖ hasherID ‖ prev_hash ‖ canonical(record) )
+//	hash = H( "tamperlog/v1" ‖ len(encoderID) ‖ encoderID ‖ len(hasherID) ‖ hasherID
+//	          ‖ prev_hash ‖ canonical(record) )
 //
-// The canonical form is produced by an [Encoder] (default [BinaryV1]) and H by
-// a [Hasher] (default [SHA256]). The first record of a stream links to a
-// genesis value of H.Size() zero bytes. [Chain.Walk] verifies a range of
-// records.
+// Lengths are 4-byte big-endian. The canonical form is produced by an
+// [Encoder] (default [BinaryV1]) and H by a [Hasher] (default [SHA256]); every
+// record names the pair it was linked with, and a stream keeps one pair for
+// its lifetime. The first record of a stream links to a genesis value of
+// H.Size() zero bytes. [Chain.Walk] verifies a range of records.
 //
 // # Storage
 //

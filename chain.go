@@ -72,6 +72,7 @@ const (
 	ReasonHashMismatch    Reason = "hash does not match the record"
 	ReasonTimeRegression  Reason = "timestamp precedes the previous record by more than the tolerance"
 	ReasonEncodingFailure Reason = "record cannot be encoded"
+	ReasonAlgorithm       Reason = "record names another encoder or hasher"
 )
 
 // BrokenChainError reports the first sequence number at which a walk fails.
@@ -104,9 +105,10 @@ type WalkOptions struct {
 const DefaultTimeTolerance = time.Second
 
 // Walk verifies recs as the records of stream from sequence first onward:
-// contiguous sequence numbers, each PrevHash equal to the previous Hash (the
-// genesis value when first is 1), each Hash recomputed from its record and,
-// when opts.TimeTolerance is set, timestamps that do not regress. It returns a
+// contiguous sequence numbers, the chain's encoder and hasher named on every
+// record, each PrevHash equal to the previous Hash (the genesis value when
+// first is 1), each Hash recomputed from its record and, when
+// opts.TimeTolerance is set, timestamps that do not regress. It returns a
 // *BrokenChainError at the first failure.
 //
 // An edit to the last record that also recomputes its hash leaves no later
@@ -126,6 +128,8 @@ func (c Chain) Walk(stream string, first int64, recs []Record, opts WalkOptions)
 			return fail(ReasonSeqMismatch, fmt.Sprintf("found seq %d", r.Seq))
 		case i == 0 && want == 1 && !bytes.Equal(r.PrevHash, c.Genesis()):
 			return fail(ReasonNotGenesis, "")
+		case r.Encoder != c.Encoder.ID() || r.Hasher != c.Hasher.ID():
+			return fail(ReasonAlgorithm, fmt.Sprintf("record says %s/%s, chain is %s/%s", r.Encoder, r.Hasher, c.Encoder.ID(), c.Hasher.ID()))
 		case i > 0 && !bytes.Equal(r.PrevHash, recs[i-1].Hash):
 			return fail(ReasonPrevHash, "")
 		case i > 0 && opts.TimeTolerance > 0 && r.At.Before(recs[i-1].At.Add(-opts.TimeTolerance)):

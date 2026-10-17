@@ -61,28 +61,59 @@ type Event struct {
 }
 
 // Record is an Event linked into its stream. At is the stamped time in UTC
-// with microsecond precision. PrevHash is the previous record's Hash, or the
-// genesis value for Seq 1.
+// with microsecond precision (see [ValidateTime]). PrevHash is the previous
+// record's Hash, or the genesis value for Seq 1. Encoder and Hasher are the
+// identifiers of the algorithms that produced Hash; every record of a stream
+// carries the same pair, which the appender enforces and seals report.
 type Record struct {
 	Event
 
 	Seq      int64
 	At       time.Time
+	Encoder  string
+	Hasher   string
 	PrevHash []byte
 	Hash     []byte
 }
 
-// Head is a stream's last link: Seq 0 and Hash nil when the stream is empty.
-// Now is the store's clock at the time the head was read, used to stamp the
-// next record.
+// Head is a stream's last link: Seq 0, Hash nil, At zero and empty algorithm
+// identifiers when the stream is empty. Now is the store's clock at the time
+// the head was read, used to stamp the next record.
 type Head struct {
-	Seq  int64
-	Hash []byte
-	Now  time.Time
+	Seq     int64
+	Hash    []byte
+	At      time.Time
+	Encoder string
+	Hasher  string
+	Now     time.Time
+}
+
+// Time bounds for [Record.At]: Unix microseconds from 0 to 2^53-1, so every
+// shipped encoder can represent them (jcs/v1 uses a JSON number).
+var (
+	MinTime = time.UnixMicro(0).UTC()
+	MaxTime = time.UnixMicro(MaxSeq).UTC()
+)
+
+// ValidateTime reports whether t is a canonical record time: within
+// [MinTime, MaxTime] and aligned to a whole microsecond. Encoders refuse other
+// values so that a stored timestamp can never differ from the hashed one.
+func ValidateTime(t time.Time) error {
+	if t.Before(MinTime) || t.After(MaxTime) {
+		return fmt.Errorf("%w: time %s outside [%s, %s]", ErrInvalidEvent, t.Format(time.RFC3339Nano), MinTime.Format(time.RFC3339), MaxTime.Format(time.RFC3339))
+	}
+	if t.Nanosecond()%1000 != 0 {
+		return fmt.Errorf("%w: time %s is not aligned to a microsecond", ErrInvalidEvent, t.Format(time.RFC3339Nano))
+	}
+	return nil
 }
 
 // Store is one open transaction on a backend. Implementations are bound to a
 // transaction object of their database; they never commit.
+//
+// Lock order: a transaction that appends to several streams must lock them
+// in a fixed order (sort the names) or two transactions can deadlock. Head
+// must honour ctx cancellation while waiting for the lock.
 type Store interface {
 	// Head locks stream against other appenders until the transaction ends
 	// and returns its last link and the store's clock. Concurrent appends to

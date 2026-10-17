@@ -11,3 +11,4 @@ coverage.*
 # local env
 .env
 *.local
+docs/reviews/raw-*.txt

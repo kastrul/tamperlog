@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -20,15 +21,38 @@ import (
 type Store struct {
 	clock func() time.Time
 
-	mu      sync.Mutex // guards streams and seals
+	mu      sync.Mutex // guards the streams map and the seal book
 	streams map[string]*stream
 	seals   *sealBook
 }
 
+// stream separates two concerns: owner is the append lock a transaction holds
+// from Head to Commit or Rollback (a channel so waiting honours ctx), data
+// guards the records for readers and the committing writer.
 type stream struct {
-	lock sync.Mutex // held by one transaction from Head to Commit or Rollback
-	recs []tamperlog.Record
+	owner chan struct{}
+	data  sync.RWMutex
+	recs  []tamperlog.Record
 }
+
+func newStream() *stream { return &stream{owner: make(chan struct{}, 1)} }
+
+// acquire takes the append lock or returns ctx.Err().
+func (st *stream) acquire(ctx context.Context) error {
+	select {
+	case st.owner <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case st.owner <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (st *stream) release() { <-st.owner }
 
 // Option configures a Store.
 type Option func(*Store)
@@ -51,10 +75,18 @@ func (s *Store) stream(name string) *stream {
 	defer s.mu.Unlock()
 	st, ok := s.streams[name]
 	if !ok {
-		st = &stream{}
+		st = newStream()
 		s.streams[name] = st
 	}
 	return st
+}
+
+// snapshot returns the streams map entries under s.mu, so callers can take
+// per-stream locks without holding s.mu.
+func (s *Store) snapshot() map[string]*stream {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return maps.Clone(s.streams)
 }
 
 // Begin opens a transaction. Records inserted through it become visible to
@@ -66,26 +98,26 @@ func (s *Store) Begin(context.Context) (tamperlog.Tx, error) {
 
 // Heads returns each non-empty stream's last link.
 func (s *Store) Heads(context.Context) (map[string]tamperlog.Head, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	out := map[string]tamperlog.Head{}
-	for name, st := range s.streams {
+	for name, st := range s.snapshot() {
+		st.data.RLock()
 		if n := len(st.recs); n > 0 {
-			out[name] = tamperlog.Head{Seq: st.recs[n-1].Seq, Hash: slices.Clone(st.recs[n-1].Hash)}
+			out[name] = headOf(st.recs[n-1], time.Time{})
 		}
+		st.data.RUnlock()
 	}
 	return out, nil
 }
 
 // FirstSeqs returns each non-empty stream's smallest kept sequence number.
 func (s *Store) FirstSeqs(context.Context) (map[string]int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	out := map[string]int64{}
-	for name, st := range s.streams {
+	for name, st := range s.snapshot() {
+		st.data.RLock()
 		if len(st.recs) > 0 {
 			out[name] = st.recs[0].Seq
 		}
+		st.data.RUnlock()
 	}
 	return out, nil
 }
@@ -94,8 +126,8 @@ func (s *Store) FirstSeqs(context.Context) (map[string]int64, error) {
 // tests and tooling, not part of any library interface.
 func (s *Store) Records(name string) []tamperlog.Record {
 	st := s.stream(name)
-	st.lock.Lock()
-	defer st.lock.Unlock()
+	st.data.RLock()
+	defer st.data.RUnlock()
 	return cloneRecords(st.recs)
 }
 
@@ -103,8 +135,8 @@ func (s *Store) Records(name string) []tamperlog.Record {
 // rewrites history. Tests use it to exercise the verifier.
 func (s *Store) Replace(name string, recs []tamperlog.Record) {
 	st := s.stream(name)
-	st.lock.Lock()
-	defer st.lock.Unlock()
+	st.data.Lock()
+	defer st.data.Unlock()
 	st.recs = cloneRecords(recs)
 }
 
@@ -112,9 +144,13 @@ func (s *Store) Replace(name string, recs []tamperlog.Record) {
 // retention drop. The caller records the matching drop event.
 func (s *Store) Drop(name string, first, last int64) {
 	st := s.stream(name)
-	st.lock.Lock()
-	defer st.lock.Unlock()
+	st.data.Lock()
+	defer st.data.Unlock()
 	st.recs = slices.DeleteFunc(st.recs, func(r tamperlog.Record) bool { return r.Seq >= first && r.Seq <= last })
+}
+
+func headOf(r tamperlog.Record, now time.Time) tamperlog.Head {
+	return tamperlog.Head{Seq: r.Seq, Hash: slices.Clone(r.Hash), At: r.At, Encoder: r.Encoder, Hasher: r.Hasher, Now: now}
 }
 
 // tx is one transaction: pending inserts plus the stream locks it holds.
@@ -127,10 +163,8 @@ type tx struct {
 
 var errDone = errors.New("memory: transaction already finished")
 
-// Head locks the stream for this transaction and returns its last link. The
-// clock advances by one microsecond per call so consecutive records in a test
-// never share a timestamp.
-func (t *tx) Head(_ context.Context, name string) (tamperlog.Head, error) {
+// Head locks the stream for this transaction and returns its last link.
+func (t *tx) Head(ctx context.Context, name string) (tamperlog.Head, error) {
 	if t.done {
 		return tamperlog.Head{}, errDone
 	}
@@ -140,28 +174,34 @@ func (t *tx) Head(_ context.Context, name string) (tamperlog.Head, error) {
 	st, held := t.locked[name]
 	if !held {
 		st = t.s.stream(name)
-		st.lock.Lock()
+		if err := st.acquire(ctx); err != nil {
+			return tamperlog.Head{}, fmt.Errorf("memory: lock %s: %w", name, err)
+		}
 		t.locked[name] = st
 	}
-	h := tamperlog.Head{Now: t.s.clock()}
+	now := t.s.clock()
 	// Pending records of this transaction are the newest.
 	for i := len(t.pending) - 1; i >= 0; i-- {
 		if t.pending[i].Stream == name {
-			h.Seq, h.Hash = t.pending[i].Seq, slices.Clone(t.pending[i].Hash)
-			return h, nil
+			return headOf(t.pending[i], now), nil
 		}
 	}
+	st.data.RLock()
+	defer st.data.RUnlock()
 	if n := len(st.recs); n > 0 {
-		h.Seq, h.Hash = st.recs[n-1].Seq, slices.Clone(st.recs[n-1].Hash)
+		return headOf(st.recs[n-1], now), nil
 	}
-	return h, nil
+	return tamperlog.Head{Now: now}, nil
 }
 
 // Insert stages r; it must follow a Head on the same stream in this
 // transaction and must not duplicate a sequence number.
-func (t *tx) Insert(_ context.Context, r tamperlog.Record) error {
+func (t *tx) Insert(ctx context.Context, r tamperlog.Record) error {
 	if t.done {
 		return errDone
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	st, held := t.locked[r.Stream]
 	if !held {
@@ -172,7 +212,10 @@ func (t *tx) Insert(_ context.Context, r tamperlog.Record) error {
 			return fmt.Errorf("memory: duplicate %s/%d", r.Stream, r.Seq)
 		}
 	}
-	if _, dup := slices.BinarySearchFunc(st.recs, r.Seq, func(x tamperlog.Record, seq int64) int { return int(x.Seq - seq) }); dup {
+	st.data.RLock()
+	_, dup := slices.BinarySearchFunc(st.recs, r.Seq, func(x tamperlog.Record, seq int64) int { return int(x.Seq - seq) })
+	st.data.RUnlock()
+	if dup {
 		return fmt.Errorf("memory: duplicate %s/%d", r.Stream, r.Seq)
 	}
 	t.pending = append(t.pending, cloneRecord(r))
@@ -180,22 +223,22 @@ func (t *tx) Insert(_ context.Context, r tamperlog.Record) error {
 }
 
 // Range reads committed records plus this transaction's pending ones.
-func (t *tx) Range(_ context.Context, name string, first, last int64) ([]tamperlog.Record, error) {
+func (t *tx) Range(ctx context.Context, name string, first, last int64) ([]tamperlog.Record, error) {
 	if t.done {
 		return nil, errDone
 	}
-	st := t.s.stream(name)
-	_, held := t.locked[name]
-	if !held {
-		st.lock.Lock()
-		defer st.lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+	st := t.s.stream(name)
+	st.data.RLock()
 	var out []tamperlog.Record
 	for _, r := range st.recs {
 		if r.Seq >= first && r.Seq <= last {
 			out = append(out, cloneRecord(r))
 		}
 	}
+	st.data.RUnlock()
 	for _, r := range t.pending {
 		if r.Stream == name && r.Seq >= first && r.Seq <= last {
 			out = append(out, cloneRecord(r))
@@ -205,13 +248,18 @@ func (t *tx) Range(_ context.Context, name string, first, last int64) ([]tamperl
 }
 
 // Commit publishes pending records and releases stream locks.
-func (t *tx) Commit(context.Context) error {
+func (t *tx) Commit(ctx context.Context) error {
 	if t.done {
 		return errDone
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for _, r := range t.pending {
 		st := t.locked[r.Stream]
+		st.data.Lock()
 		st.recs = append(st.recs, r)
+		st.data.Unlock()
 	}
 	t.finish()
 	return nil
@@ -231,7 +279,7 @@ func (t *tx) finish() {
 	t.done = true
 	t.pending = nil
 	for _, st := range t.locked {
-		st.lock.Unlock()
+		st.release()
 	}
 	t.locked = nil
 }
@@ -241,11 +289,7 @@ func cloneRecord(r tamperlog.Record) tamperlog.Record {
 	r.Hash = slices.Clone(r.Hash)
 	r.PayloadHash = slices.Clone(r.PayloadHash)
 	if r.Attributes != nil {
-		m := make(map[string]string, len(r.Attributes))
-		for k, v := range r.Attributes {
-			m[k] = v
-		}
-		r.Attributes = m
+		r.Attributes = maps.Clone(r.Attributes)
 	}
 	return r
 }

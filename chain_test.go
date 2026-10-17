@@ -39,20 +39,27 @@ func goldenRecord() tamperlog.Record {
 
 func TestGoldenVectors(t *testing.T) {
 	t.Parallel()
-	cases := []struct {
-		name                string
-		enc                 tamperlog.Encoder
-		h                   tamperlog.Hasher
-		wantCanonicalPrefix string
-		wantHash            string
-	}{
-		{"binary/v1 sha256", tamperlog.BinaryV1, tamperlog.SHA256, "0000000463686174", ""},
-		{"binary/v1 sha3-256", tamperlog.BinaryV1, tamperlog.SHA3256, "0000000463686174", ""},
-		{"binary/v1 sha512-256", tamperlog.BinaryV1, tamperlog.SHA512256, "0000000463686174", ""},
-		{"jcs/v1 sha256", jcs.V1, tamperlog.SHA256, hex.EncodeToString([]byte(`{"action":"message.read","actor":"0199f5a0-0000-7000-8000-000000000001","at":1791892800123456,"attributes":{"channel":"web","purpose":"treatment"},"entity":"chat_message","entity_id":"0199f5a0-0000-7000-8000-000000000002","payload_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":1,"stream":"chat","subject":""}`)), ""},
+	type vector struct {
+		name          string
+		enc           tamperlog.Encoder
+		h             tamperlog.Hasher
+		wantCanonical string
+		wantHash      string
 	}
-	for i := range cases {
-		cases[i].wantHash = goldenHashes[cases[i].name]
+	cases := make([]vector, 0, 2*len(tamperlog.Hashers()))
+	for _, enc := range []tamperlog.Encoder{tamperlog.BinaryV1, jcs.V1} {
+		for _, h := range tamperlog.Hashers() {
+			name := enc.ID() + " " + h.ID()
+			want, ok := goldenHashes[name]
+			if !ok {
+				t.Fatalf("no golden hash for %s", name)
+			}
+			canonical := goldenBinaryV1
+			if enc == jcs.V1 {
+				canonical = hex.EncodeToString([]byte(goldenJCSV1))
+			}
+			cases = append(cases, vector{name, enc, h, canonical, want})
+		}
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -63,7 +70,7 @@ func TestGoldenVectors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := hex.EncodeToString(canonical); len(got) < len(c.wantCanonicalPrefix) || got[:len(c.wantCanonicalPrefix)] != c.wantCanonicalPrefix {
+			if got := hex.EncodeToString(canonical); got != c.wantCanonical {
 				t.Fatalf("canonical = %s", got)
 			}
 			got, err := chain.Link(r)
@@ -77,14 +84,66 @@ func TestGoldenVectors(t *testing.T) {
 	}
 }
 
-func TestBinaryV1CanonicalBytes(t *testing.T) {
+func TestEncodersRejectNonCanonicalTimes(t *testing.T) {
 	t.Parallel()
-	b, err := tamperlog.BinaryV1.Encode(goldenRecord())
-	if err != nil {
+	for _, enc := range []tamperlog.Encoder{tamperlog.BinaryV1, jcs.V1} {
+		r := goldenRecord()
+		r.At = r.At.Add(time.Nanosecond)
+		if _, err := enc.Encode(r); !errors.Is(err, tamperlog.ErrInvalidEvent) {
+			t.Errorf("%s: nanosecond time: %v", enc.ID(), err)
+		}
+		r.At = tamperlog.MaxTime.Add(time.Microsecond)
+		if _, err := enc.Encode(r); !errors.Is(err, tamperlog.ErrInvalidEvent) {
+			t.Errorf("%s: time after MaxTime: %v", enc.ID(), err)
+		}
+		r.At = time.Unix(-1, 0)
+		if _, err := enc.Encode(r); !errors.Is(err, tamperlog.ErrInvalidEvent) {
+			t.Errorf("%s: time before 1970: %v", enc.ID(), err)
+		}
+		r = goldenRecord()
+		r.Seq = tamperlog.MaxSeq + 1
+		if _, err := enc.Encode(r); err == nil {
+			t.Errorf("%s: seq above MaxSeq accepted", enc.ID())
+		}
+	}
+}
+
+func TestTimeRegressionIsRefused(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
+	s := memory.New(memory.WithClock(func() time.Time { return now }))
+	log := tamperlog.NewLog(s, tamperlog.WithCallerTime())
+	if _, err := log.Append(ctx, tamperlog.Event{Stream: "s", Action: "a", Entity: "e", Time: now.Add(4 * time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	if hex.EncodeToString(b) != goldenBinaryV1 {
-		t.Fatalf("binary/v1 canonical =\n%x\nwant\n%s", b, goldenBinaryV1)
+	_, err := log.Append(ctx, tamperlog.Event{Stream: "s", Action: "a", Entity: "e", Time: now.Add(2 * time.Second)})
+	if !errors.Is(err, tamperlog.ErrClockSkew) {
+		t.Fatalf("regression of 2 s with 1 s tolerance: %v", err)
+	}
+	if _, err := log.Append(ctx, tamperlog.Event{Stream: "s", Action: "a", Entity: "e", Time: now.Add(3500 * time.Millisecond)}); err != nil {
+		t.Fatalf("regression within tolerance: %v", err)
+	}
+	// A store clock that jumps backwards is refused too.
+	now = now.Add(-time.Hour)
+	if _, err := tamperlog.NewLog(s).Append(ctx, tamperlog.Event{Stream: "s", Action: "a", Entity: "e"}); !errors.Is(err, tamperlog.ErrClockSkew) {
+		t.Fatalf("store clock regression: %v", err)
+	}
+}
+
+func TestLogAppendRollsBackOnPanic(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := memory.New()
+	log := tamperlog.NewLog(s, tamperlog.WithHooks(tamperlog.Hooks{OnAppend: func(context.Context, tamperlog.Record) { panic("hook") }}))
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = log.Append(ctx, tamperlog.Event{Stream: "s", Action: "a", Entity: "e"})
+	}()
+	c, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if _, err := tamperlog.NewLog(s).Append(c, tamperlog.Event{Stream: "s", Action: "a", Entity: "e"}); err != nil {
+		t.Fatalf("stream still locked after a panicking hook: %v", err)
 	}
 }
 
@@ -164,7 +223,7 @@ func TestCallerTime(t *testing.T) {
 		t.Fatalf("zero time: %v", err)
 	}
 	// Without the option the caller's time is ignored.
-	r, err = tamperlog.NewLog(s).Append(ctx, tamperlog.Event{Stream: "s", Action: "a", Entity: "e", Time: now.Add(time.Hour)})
+	r, err = tamperlog.NewLog(s).Append(ctx, tamperlog.Event{Stream: "other", Action: "a", Entity: "e", Time: now.Add(time.Hour)})
 	if err != nil || !r.At.Equal(now) {
 		t.Fatalf("default stamping: %s, %v", r.At, err)
 	}
@@ -252,6 +311,8 @@ var edits = []edit{
 		m["zz"] = "added"
 		r.Attributes = m
 	}},
+	{"encoder", false, func(r *tamperlog.Record) { r.Encoder += "x" }},
+	{"hasher", false, func(r *tamperlog.Record) { r.Hasher += "x" }},
 	{"prev_hash", false, func(r *tamperlog.Record) { r.PrevHash = bytes.Clone(r.PrevHash); r.PrevHash[0] ^= 1 }},
 	{"hash", false, func(r *tamperlog.Record) { r.Hash = bytes.Clone(r.Hash); r.Hash[0] ^= 1 }},
 }
@@ -362,8 +423,9 @@ func TestEncodersAreInjective(t *testing.T) {
 		t.Run(enc.ID(), func(t *testing.T) {
 			t.Parallel()
 			rapid.Check(t, func(t *rapid.T) {
-				a := tamperlog.Record{Event: eventGen().Draw(t, "a"), Seq: int64(rapid.IntRange(1, 1000).Draw(t, "seqa")), At: time.UnixMicro(int64(rapid.IntRange(0, 1<<40).Draw(t, "ata"))).UTC()}
-				b := tamperlog.Record{Event: eventGen().Draw(t, "b"), Seq: int64(rapid.IntRange(1, 1000).Draw(t, "seqb")), At: time.UnixMicro(int64(rapid.IntRange(0, 1<<40).Draw(t, "atb"))).UTC()}
+				at := time.UnixMicro(int64(rapid.IntRange(0, 1<<40).Draw(t, "at"))).UTC()
+				a := tamperlog.Record{Event: eventGen().Draw(t, "a"), Seq: int64(rapid.IntRange(1, 1000).Draw(t, "seqa")), At: at}
+				b := tamperlog.Record{Event: eventGen().Draw(t, "b"), Seq: int64(rapid.IntRange(1, 1000).Draw(t, "seqb")), At: at.Add(time.Duration(rapid.IntRange(0, 3).Draw(t, "dt")) * time.Microsecond)}
 				ea, err := enc.Encode(a)
 				if err != nil {
 					t.Fatal(err)

@@ -16,6 +16,7 @@ package jcs
 
 import (
 	"encoding/hex"
+	"fmt"
 
 	"github.com/kastrul/tamperlog"
 	"github.com/kastrul/tamperlog/internal/jcs"
@@ -29,6 +30,12 @@ type v1 struct{}
 func (v1) ID() string { return "jcs/v1" }
 
 func (v1) Encode(r tamperlog.Record) ([]byte, error) {
+	if r.Seq < 0 || r.Seq > tamperlog.MaxSeq {
+		return nil, fmt.Errorf("jcs/v1: seq %d out of range", r.Seq)
+	}
+	if err := tamperlog.ValidateTime(r.At); err != nil {
+		return nil, fmt.Errorf("jcs/v1: %w", err)
+	}
 	attrs := make(map[string]any, len(r.Attributes))
 	for k, v := range r.Attributes {
 		attrs[k] = v

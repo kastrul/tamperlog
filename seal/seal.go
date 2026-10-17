@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/kastrul/tamperlog"
 	"github.com/kastrul/tamperlog/internal/jcs"
 )
 
@@ -83,6 +84,69 @@ type Seal struct {
 // GenesisHash is PrevSealHash of the first seal.
 var GenesisHash = make([]byte, sha256.Size)
 
+// MaxSeq bounds seal sequence numbers so every encoder can represent them.
+const MaxSeq = 1<<53 - 1
+
+// ErrInvalid wraps every structural failure found by [Seal.Validate].
+var ErrInvalid = errors.New("seal: invalid")
+
+// Validate checks the document's structure: schema, sequence bounds, genesis
+// rule for Seq 1, a 32-byte PrevSealHash, streams sorted by name without
+// duplicates and with legal names, non-empty algorithm identifiers,
+// 1 <= first_kept_seq <= head_seq <= MaxSeq, head hashes and drop digests of
+// 32 to 64 bytes, a non-empty writer, and signature and key_id present
+// together. Comparison with the previous seal and with the live chain is the
+// verifier's job.
+func (s *Seal) Validate() error {
+	fail := func(format string, a ...any) error {
+		return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, a...))
+	}
+	if s.Schema != Schema {
+		return fail("schema %q, want %q", s.Schema, Schema)
+	}
+	if s.Seq < 1 || s.Seq > MaxSeq {
+		return fail("seq %d out of range", s.Seq)
+	}
+	if s.SealedAt.IsZero() || s.SealedAt.Year() < 1970 || s.SealedAt.Year() > 9999 {
+		return fail("sealed_at %s out of range", s.SealedAt)
+	}
+	if len(s.PrevSealHash) != sha256.Size {
+		return fail("prev_seal_hash is %d bytes, want %d", len(s.PrevSealHash), sha256.Size)
+	}
+	if s.Seq == 1 && !bytes.Equal(s.PrevSealHash, GenesisHash) {
+		return fail("first seal must link to genesis")
+	}
+	for i, h := range s.Streams {
+		if err := tamperlog.ValidateStream(h.Stream); err != nil {
+			return fail("stream %d: %v", i, err)
+		}
+		if i > 0 && s.Streams[i-1].Stream >= h.Stream {
+			return fail("streams not sorted or duplicated at %q", h.Stream)
+		}
+		if h.Encoder == "" || len(h.Encoder) > 63 || h.Hasher == "" || len(h.Hasher) > 63 {
+			return fail("stream %s: encoder or hasher identifier missing", h.Stream)
+		}
+		if h.FirstKeptSeq < 1 || h.HeadSeq < h.FirstKeptSeq || h.HeadSeq > MaxSeq {
+			return fail("stream %s: range %d..%d", h.Stream, h.FirstKeptSeq, h.HeadSeq)
+		}
+		if len(h.HeadHash) < 32 || len(h.HeadHash) > 64 {
+			return fail("stream %s: head hash is %d bytes", h.Stream, len(h.HeadHash))
+		}
+	}
+	for i, d := range s.Drops {
+		if len(d) < 32 || len(d) > 64 {
+			return fail("drop %d is %d bytes", i, len(d))
+		}
+	}
+	if s.Writer == "" || len(s.Writer) > 255 {
+		return fail("writer missing or too long")
+	}
+	if (s.KeyID == "") != (len(s.Signature) == 0) {
+		return fail("key_id and signature must be present together")
+	}
+	return nil
+}
+
 // Canonical returns the RFC 8785 serialisation of s including the signature
 // when present. These are the bytes stored, sunk and hashed.
 func (s *Seal) Canonical() ([]byte, error) { return s.canonical(true) }
@@ -92,8 +156,8 @@ func (s *Seal) Canonical() ([]byte, error) { return s.canonical(true) }
 func (s *Seal) SigningBytes() ([]byte, error) { return s.canonical(false) }
 
 func (s *Seal) canonical(withSignature bool) ([]byte, error) {
-	if s.Schema != Schema {
-		return nil, fmt.Errorf("seal: schema %q, want %q", s.Schema, Schema)
+	if err := s.Validate(); err != nil {
+		return nil, err
 	}
 	streams := make([]any, len(s.Streams))
 	for i, h := range s.Streams {
@@ -148,8 +212,8 @@ func Parse(b []byte) (*Seal, error) {
 	if err := dec.Decode(&s); err != nil {
 		return nil, fmt.Errorf("seal: parse: %w", err)
 	}
-	if s.Schema != Schema {
-		return nil, fmt.Errorf("seal: schema %q, want %q", s.Schema, Schema)
+	if dec.More() {
+		return nil, ErrNotCanonical
 	}
 	again, err := s.Canonical()
 	if err != nil {
