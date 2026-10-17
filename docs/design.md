@@ -1,8 +1,10 @@
 # tamperlog design
 
-Status: approved 2026-10-17. Decisions are recorded individually in `docs/adr/`.
-Wire formats are specified normatively in `SPEC.md`; what each layer defends
-against is in `THREAT_MODEL.md`.
+Status: approved 2026-10-17, implemented the same day. Decisions are
+recorded individually in `docs/adr/`. Wire formats are specified normatively
+in `SPEC.md`; what each layer defends against is in `THREAT_MODEL.md`. Two
+independent review rounds changed details noted at the end of this document
+(`docs/reviews/`).
 
 ## What it is
 
@@ -53,9 +55,7 @@ Private GitHub repository `kastrul/tamperlog`, pushed after each milestone.
 
 ```
 tamperlog/                 core: Event, Record, Head, Store, Appender, Log, Walk, errors, options
-  encoding/binary          binary/v1 canonical encoder
-  encoding/jcs             jcs/v1 canonical encoder (RFC 8785)
-  hash/                    Hasher registry: sha256, sha3-256, sha512-256
+  encoding/jcs             jcs/v1 canonical encoder (RFC 8785); binary/v1 and the hashers live in the root
   sign/                    Signer interface, ed25519, hmac
   seal/                    Seal format, Writer, Sink interface, seal verification
   seal/sinks/fs            write-once filesystem sink
@@ -67,7 +67,8 @@ tamperlog/                 core: Event, Record, Head, Store, Appender, Log, Walk
   bundle/                  export bundle writer and reader
   store/memory             in-memory Store
   store/pgx                PostgreSQL via pgx/v5 (+ embedded SQL)
-  store/pgsql              PostgreSQL via database/sql (+ shared SQL)
+  store/pgsql              PostgreSQL via database/sql
+  store/postgres           SQL and logic shared by pgx and pgsql
   store/sqlite             SQLite via modernc.org/sqlite (+ embedded SQL)
   otel/                    OpenTelemetry metrics instrumentation
   cmd/tamperlog            kong CLI
@@ -129,6 +130,25 @@ length for the chosen hasher).
 6. Verify: library API, continuous runner, bundle format, CLI.
 7. Docs: README, SPEC, THREAT_MODEL, backends, examples, migration note, CHANGELOG.
 8. Codex review after steps 2, 3, 4+5, 6, 7; notes in docs/reviews/.
+
+## Changes after review
+
+- Every record carries its encoder and hasher identifiers; a stream keeps one
+  pair, enforced by the appender, the PostgreSQL trigger and the verifier.
+- `Head` returns the head record's time and algorithm pair; appends refuse a
+  time more than one second before the head.
+- The PostgreSQL trigger recomputes the `binary/v1` + `sha256` hash in SQL and
+  refuses a mismatch; other pairs get shape checks only.
+- One proof per seal and provider.
+- Gaps are accepted only at the start of a stream and only when bridged by
+  sealed drop events (`WithAllowInnerGaps` for legacy layouts); drop events
+  carry edge hashes so consecutive drops chain.
+- The verifier reconciles sink inventories against the source, pages up to
+  the last seal, applies freshness policies, and forces a periodic full walk
+  in incremental mode.
+- The `hash/` package in the layout sketch was folded into the root package;
+  there is no separate `encoding/binary` package (the default encoder is
+  `tamperlog.BinaryV1`).
 
 ## Deliberately out of scope for v0.1
 
