@@ -124,9 +124,15 @@ its time and the integrity of the data bound to it.
 Cannot detect: events inside the interval before the next anchored seal;
 events never written; a compromised authority (mitigation: RFC 3161 advises
 tokens from two authorities, and the `Provider` interface takes several).
-Loss of all proofs (database and every sink) removes layer 4 for the affected
-seals; copies pushed to a party outside the operator (the DPO, a customer, an
-auditor) close that gap.
+A proof says a seal hash existed by a time; it does not by itself say that
+this seal is the latest or the only history. If an insider replaces the
+database, every sink and every stored proof with an older but authentic
+state, the verifier sees a consistent, anchored history and only the
+freshness policy (latest seal too old, interval too long) raises an alarm.
+Detecting that replacement with certainty needs a commitment that survived
+outside the operator's reach: proofs or seals pushed to the DPO, a customer
+or an auditor, the authority's own issuance records, or a witness. Loss of all
+proofs (database and every sink) removes layer 4 for the affected seals.
 
 ## Verification
 
@@ -145,11 +151,14 @@ checks every seal, re-hashes every sealed head and compares the checkpoint
 record, so a rewrite that reaches a sealed head or the checkpoint is caught;
 an edit of a non-head record before the checkpoint that keeps its stored hash
 is not seen until the next full walk, which the runner forces on a schedule
-(default daily). The verifier also lists every configured sink and reports
-seals a sink holds beyond the source's last seal, which is how a rollback of
-database and records to an older authentic state shows up, and applies
-freshness policies (latest seal age, maximum interval, future skew) so an
-old but authentic state does not stay "verified" forever.
+(default daily). The verifier also lists every configured sink (for S3, including keys
+hidden behind delete markers) and reports seals a sink holds beyond the
+source's last seal, which is how a rollback of database and records to an
+older authentic state shows up while the sink still has the later seals. The
+freshness policies (latest seal age, maximum interval, future skew) are what
+catches a rollback that took the sinks with it; the latest-seal age check must
+be configured (the CLI insists on it or on an explicit opt-out), the future
+skew check is on by default.
 
 Gaps are accepted only at the start of a stream: retention removes the
 oldest records. An inner gap is an error even with a sealed drop event, so

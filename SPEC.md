@@ -142,7 +142,12 @@ A verifier accepts a gap only when drop events chain across it: the first
 drop's `first_prev_hash` equals the hash of the record before the gap (or
 genesis), each next drop's `first_prev_hash` equals the previous drop's
 `last_hash`, and the record after the gap has `prev_hash` equal to the last
-drop's `last_hash`. A stream's newest record is never dropped.
+drop's `last_hash`; and only when every drop's digest appears in a seal (a
+drop no seal lists leaves the gap pending). By default a gap must begin at
+sequence 1, because retention removes the oldest records; a gap inside a
+stream is a failure even with sealed drop events unless the verifier is
+configured for layouts that drop inner ranges. A stream's newest record is
+never dropped.
 
 ## 4. Seals: `tamperlog.seal/1`
 

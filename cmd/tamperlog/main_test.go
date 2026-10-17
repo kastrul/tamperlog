@@ -54,7 +54,13 @@ func TestSQLiteEndToEnd(t *testing.T) {
 	if err != nil || !bytes.Contains([]byte(out), []byte("seal 1 ")) {
 		t.Fatalf("seal: %v\n%s", err, out)
 	}
-	out, err = runCLI(t, append([]string{"verify", "--sink-dir", sink}, store...)...)
+	// Without an explicit scope the command refuses to run (exit 2).
+	_, err = runCLI(t, append([]string{"verify", "--sink-dir", sink}, store...)...)
+	var scopeExit *exitError
+	if !asExit(err, &scopeExit) || scopeExit.code != 2 {
+		t.Fatalf("verify without scope: %v", err)
+	}
+	out, err = runCLI(t, append([]string{"verify", "--sink-dir", sink, "--no-anchors", "--max-seal-age", "24h"}, store...)...)
 	if err != nil || !bytes.Contains([]byte(out), []byte("verified: 1 streams, 1 seals")) {
 		t.Fatalf("verify: %v\n%s", err, out)
 	}
@@ -62,7 +68,7 @@ func TestSQLiteEndToEnd(t *testing.T) {
 	if _, err := runCLI(t, append([]string{"export", "--out", bundleDir}, store...)...); err != nil {
 		t.Fatal(err)
 	}
-	out, err = runCLI(t, "verify", "--bundle", bundleDir, "--sink-dir", sink, "--json")
+	out, err = runCLI(t, "verify", "--bundle", bundleDir, "--sink-dir", sink, "--json", "--no-anchors")
 	if err != nil || !bytes.Contains([]byte(out), []byte(`"full": true`)) {
 		t.Fatalf("offline verify: %v\n%s", err, out)
 	}
@@ -75,9 +81,14 @@ func TestSQLiteEndToEnd(t *testing.T) {
 	if err := os.WriteFile(p, []byte(`{"forged":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = runCLI(t, append([]string{"verify", "--sink-dir", sink}, store...)...)
+	_, err = runCLI(t, append([]string{"verify", "--sink-dir", sink, "--no-anchors", "--max-seal-age", "24h"}, store...)...)
 	var exit *exitError
 	if !asExit(err, &exit) || exit.code != 1 {
 		t.Fatalf("tampered sink: %v", err)
+	}
+	// An unreadable source is an operational failure (exit 2), not a finding.
+	_, err = runCLI(t, "verify", "--driver", "sqlite", "--dsn", filepath.Join(dir, "missing.db"), "--no-sinks", "--no-anchors", "--no-freshness")
+	if !asExit(err, &exit) || exit.code != 2 {
+		t.Fatalf("missing database: %v", err)
 	}
 }

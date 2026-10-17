@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/kastrul/tamperlog"
@@ -184,6 +185,9 @@ type verifyCmd struct {
 	sinkFlags
 	tsaFlags
 	Bundle          string            `type:"existingdir" help:"Verify an export bundle instead of a database."`
+	NoAnchors       bool              `name:"no-anchors" help:"Explicitly skip proof verification (otherwise --tsa-roots is required)."`
+	NoSinks         bool              `name:"no-sinks" help:"Explicitly skip sink comparison (otherwise a sink is required)."`
+	NoFreshness     bool              `name:"no-freshness" help:"Explicitly skip the latest-seal age check (otherwise --max-seal-age is required)."`
 	Pubkey          map[string]string `help:"Ed25519 seal signature keys, keyid=hex; when given every seal must be signed." mapsep:","`
 	Interval        time.Duration     `help:"Run continuously every interval and record outcomes in the system stream; default is one run."`
 	JSON            bool              `name:"json" help:"Print the report as JSON."`
@@ -194,7 +198,43 @@ type verifyCmd struct {
 	Full            bool              `help:"Force full walks in continuous mode (default: daily full walk, incremental otherwise)."`
 }
 
+// scopeErrors returns the configuration mistakes that would make a run
+// verify less than the operator thinks. Every external layer must be either
+// configured or explicitly skipped.
+func (c *verifyCmd) scopeErrors() error {
+	var problems []string
+	hasSink := c.SinkDir != "" || c.S3Bucket != ""
+	switch {
+	case c.TSARoots == "" && !c.NoAnchors:
+		problems = append(problems, "proofs are not verified: pass --tsa-roots or --no-anchors")
+	case c.TSARoots != "" && c.NoAnchors:
+		problems = append(problems, "--tsa-roots and --no-anchors conflict")
+	}
+	if c.TSARoots == "" && (c.TSAPolicy != "" || c.EUTLCache != "" || c.TSAURL != "") {
+		problems = append(problems, "--tsa-url, --tsa-policy and --eutl-cache have no effect without --tsa-roots")
+	}
+	switch {
+	case !hasSink && !c.NoSinks:
+		problems = append(problems, "no sink to compare against: pass --sink-dir or --s3-bucket, or --no-sinks")
+	case hasSink && c.NoSinks:
+		problems = append(problems, "a sink and --no-sinks conflict")
+	}
+	switch {
+	case c.MaxSealAge <= 0 && !c.NoFreshness && c.Bundle == "":
+		problems = append(problems, "latest-seal age is not checked: pass --max-seal-age (a few seal intervals) or --no-freshness")
+	case c.MaxSealAge > 0 && c.NoFreshness:
+		problems = append(problems, "--max-seal-age and --no-freshness conflict")
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return &exitError{code: 2, msg: "verification scope: " + strings.Join(problems, "; ")}
+}
+
 func (c *verifyCmd) Run(rc *runContext) error {
+	if err := c.scopeErrors(); err != nil {
+		return err
+	}
 	var src verify.Source
 	var log *tamperlog.Log
 	switch {
@@ -227,7 +267,7 @@ func (c *verifyCmd) Run(rc *runContext) error {
 	if c.AllowInnerGaps {
 		opts = append(opts, verify.WithAllowInnerGaps())
 	}
-	if c.TSAURL != "" || c.TSARoots != "" {
+	if c.TSARoots != "" {
 		prov, err := c.provider(rc.ctx, false)
 		if err != nil {
 			return err
@@ -251,29 +291,62 @@ func (c *verifyCmd) Run(rc *runContext) error {
 	}
 	v := verify.New(opts...)
 	if c.Interval > 0 {
-		ropts := []verify.RunnerOption{verify.WithOnReport(func(_ context.Context, rep *verify.Report) { c.print(rep) })}
+		var last *verify.Report
+		ropts := []verify.RunnerOption{verify.WithOnReport(func(_ context.Context, rep *verify.Report) {
+			last = rep
+			if err := c.print(rep); err != nil {
+				rc.logger.Error("print report", "err", err)
+			}
+		})}
 		if log != nil {
 			ropts = append(ropts, verify.WithLog(log))
 		}
 		if !c.Full {
 			ropts = append(ropts, verify.WithIncremental(24*time.Hour))
 		}
-		return ignoreCancel(verify.NewRunner(v, src, ropts...).Run(rc.ctx, c.Interval))
+		err := ignoreCancel(verify.NewRunner(v, src, ropts...).Run(rc.ctx, c.Interval))
+		if err != nil {
+			return err
+		}
+		// Continuous mode ends only when stopped; the exit status reflects
+		// the last report so a supervisor sees a broken state.
+		return exitFor(last)
 	}
 	rep := v.Verify(rc.ctx, src, nil)
-	c.print(rep)
-	if !rep.OK() {
-		return &exitError{code: 1, msg: "verification found errors"}
+	if err := c.print(rep); err != nil {
+		return err
 	}
-	return nil
+	return exitFor(rep)
 }
 
-func (c *verifyCmd) print(rep *verify.Report) {
+// exitFor maps a report to the documented exit status: 0 verified, 1 an
+// integrity finding, 2 an operational failure (the evidence could not be
+// read, so nothing is known either way).
+func exitFor(rep *verify.Report) error {
+	switch {
+	case rep == nil:
+		return nil
+	case rep.Operational():
+		return &exitError{code: 2, msg: "verification could not complete: " + firstError(rep)}
+	case !rep.OK():
+		return &exitError{code: 1, msg: "verification found errors: " + firstError(rep)}
+	default:
+		return nil
+	}
+}
+
+func firstError(rep *verify.Report) string {
+	if errs := rep.Errors(); len(errs) > 0 {
+		return errs[0].String()
+	}
+	return ""
+}
+
+func (c *verifyCmd) print(rep *verify.Report) error {
 	if c.JSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(rep)
-		return
+		return enc.Encode(rep)
 	}
 	fmt.Println(rep.Summary())
 	for _, f := range rep.Findings {
@@ -289,6 +362,7 @@ func (c *verifyCmd) print(rep *verify.Report) {
 		}
 		fmt.Printf("  stream %-24s %s head=%d kept_from=%d records=%d sealed_head=%d unsealed=%d gaps=%d\n", name, state, s.HeadSeq, s.FirstKeptSeq, s.Records, s.SealedHead, s.Unsealed, len(s.Gaps))
 	}
+	return nil
 }
 
 // ---- export ----

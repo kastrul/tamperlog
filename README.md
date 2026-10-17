@@ -2,8 +2,9 @@
 
 Tamper-evident audit trails for Go services: a per-stream hash chain written
 in your own database transaction, periodic seals in write-once storage,
-RFC 3161 qualified timestamps on every seal, and a verifier that starts from
-the evidence an insider cannot forge and works inward.
+RFC 3161 timestamps on every seal (qualified under eIDAS when the authority
+you configure is a qualified trust service provider), and a verifier that
+starts from the evidence an insider cannot forge and works inward.
 
 Built for a health-data platform (GDPR Article 9, EU MDR, NIS2, E-ITS), where
 the question an auditor asks is not "do you have logs" but "can your own
@@ -133,13 +134,18 @@ tamperlog anchor  --driver pgx --dsn "$DSN" --schema audit --sink-dir /srv/seals
 tamperlog verify  --driver pgx --dsn "$DSN" --schema audit --sink-dir /srv/seals \
                   --tsa-roots sk-test-tsa-ca.pem --max-seal-age 3h
 tamperlog export  --driver pgx --dsn "$DSN" --schema audit --out /tmp/bundle
-tamperlog verify  --bundle /tmp/bundle --tsa-roots sk-test-tsa-ca.pem      # no database needed
+tamperlog verify  --bundle /tmp/bundle --tsa-roots sk-test-tsa-ca.pem --no-sinks   # no database needed
 tamperlog inspect token /srv/seals/seals/000000000001.rfc3161.proof
 ```
 
-`verify` exits 0 when every check passes, 1 when a finding has severity
-error, 2 on an operational failure. Flags double as environment variables
-(`TAMPERLOG_DSN`, …). The SK ID Solutions demo endpoint and its test CA
+`verify` refuses to run unless every external layer is either configured or
+explicitly skipped (`--tsa-roots` or `--no-anchors`; a sink or `--no-sinks`;
+`--max-seal-age` or `--no-freshness`), and prints the scope it ran with. It
+exits 0 when every check passes, 1 when a finding has severity error, 2 when
+the evidence could not be read (source or sink errors) or the configuration is
+rejected; in continuous mode the status reflects the last report when the
+process is stopped. Flags double as environment variables (`TAMPERLOG_DSN`,
+…). The SK ID Solutions demo endpoint and its test CA
 certificate (`TEST of SK TSA CA 2023E`, from the SK certificate repository)
 work without an account; production access is a contract with SK.
 
@@ -149,8 +155,9 @@ work without an account; production access is a contract with SK.
   or withholding them. Fail the request when `Append` fails, keep credentials
   short-lived, and alert on silence.
 - It does not make a database administrator unable to edit rows. It makes the
-  edit visible at the next verification, against seals and anchors the
-  administrator could not have produced.
+  edit visible at the next full verification that has seals and anchors to
+  compare against (an incremental run re-links only new records; records
+  newer than the last seal are not yet committed to anything).
 - It does not store payloads. Commit to them with `tamperlog.Commit` and keep
   them in an erasable table, so GDPR erasure leaves the chain intact.
 - Shipped in v0.1: no OpenTimestamps provider, no KMS or Vault signer (the

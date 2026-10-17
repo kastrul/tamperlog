@@ -218,14 +218,52 @@ type SealReport struct {
 	Qualified int64     `json:"qualified"` // seals with a proof from a qualified authority
 }
 
+// Scope records which checks a run was configured to perform, so a reader
+// of the report can tell a full verification from one with layers disabled.
+type Scope struct {
+	Anchors           []string      `json:"anchors"`            // provider identifiers whose proofs are verified
+	Sinks             int           `json:"sinks"`              // sinks whose copies and inventories are compared
+	SignatureRequired bool          `json:"signature_required"` // every seal must carry a verifiable signature
+	MaxSealAge        time.Duration `json:"max_seal_age"`       // 0: not enforced
+	MaxSealInterval   time.Duration `json:"max_seal_interval"`  // 0: not enforced
+	AnchorGrace       time.Duration `json:"anchor_grace"`
+	AllowInnerGaps    bool          `json:"allow_inner_gaps"`
+}
+
+// String is a one-line description for logs.
+func (s Scope) String() string {
+	anchors := "none"
+	if len(s.Anchors) > 0 {
+		anchors = strings.Join(s.Anchors, ",")
+	}
+	age := "off"
+	if s.MaxSealAge > 0 {
+		age = s.MaxSealAge.String()
+	}
+	return fmt.Sprintf("anchors=%s sinks=%d signatures=%v max_seal_age=%s inner_gaps=%v", anchors, s.Sinks, s.SignatureRequired, age, s.AllowInnerGaps)
+}
+
 // Report is the verifier's result.
 type Report struct {
 	StartedAt  time.Time               `json:"started_at"`
 	FinishedAt time.Time               `json:"finished_at"`
 	Full       bool                    `json:"full"` // every record re-linked (no checkpoints used)
+	Scope      Scope                   `json:"scope"`
 	Seals      SealReport              `json:"seals"`
 	Streams    map[string]StreamReport `json:"streams"`
 	Findings   []Finding               `json:"findings"`
+}
+
+// Operational reports whether a finding is an error reading the source or a
+// sink rather than an integrity failure. Callers map these to a different
+// exit status: the evidence was not checked, not found wanting.
+func (r *Report) Operational() bool {
+	for _, f := range r.Findings {
+		if f.Severity == Error && (f.Code == CodeSourceError || f.Code == CodeSinkError) {
+			return true
+		}
+	}
+	return false
 }
 
 // OK reports whether no finding has severity Error.
@@ -267,7 +305,11 @@ func (r *Report) Summary() string {
 	if e > 0 {
 		state = "BROKEN"
 	}
-	return fmt.Sprintf("%s: %d streams, %d seals (%d anchored), %d errors, %d warnings, %s", state, len(r.Streams), r.Seals.Count, r.Seals.Anchored, e, w, r.FinishedAt.Sub(r.StartedAt).Round(time.Millisecond))
+	mode := "full"
+	if !r.Full {
+		mode = "incremental"
+	}
+	return fmt.Sprintf("%s: %d streams, %d seals (%d anchored), %d errors, %d warnings, %s, %s run, scope %s", state, len(r.Streams), r.Seals.Count, r.Seals.Anchored, e, w, r.FinishedAt.Sub(r.StartedAt).Round(time.Millisecond), mode, r.Scope)
 }
 
 // HeadsDigest is SHA-256 over the JCS encoding of every stream's head
@@ -426,13 +468,21 @@ type Checkpoint struct {
 
 // Verify runs every check and returns the report. checkpoints may be nil.
 func (v *Verifier) Verify(ctx context.Context, src Source, checkpoints map[string]Checkpoint) *Report {
-	r := &Report{StartedAt: v.now().UTC(), Streams: map[string]StreamReport{}, Full: len(checkpoints) == 0}
+	r := &Report{StartedAt: v.now().UTC(), Streams: map[string]StreamReport{}, Full: len(checkpoints) == 0, Scope: v.scope()}
 	seals, drops := v.verifySeals(ctx, src, r)
 	v.verifyStreams(ctx, src, r, seals, drops, checkpoints)
 	r.FinishedAt = v.now().UTC()
 	sort.SliceStable(r.Findings, func(i, j int) bool { return rank(r.Findings[i].Severity) < rank(r.Findings[j].Severity) })
 	v.logger.InfoContext(ctx, "tamperlog verification finished", "summary", r.Summary())
 	return r
+}
+
+func (v *Verifier) scope() Scope {
+	sc := Scope{Sinks: len(v.sinks), SignatureRequired: v.sigVerifier != nil, MaxSealAge: v.maxSealAge, MaxSealInterval: v.maxSealInterval, AnchorGrace: v.anchorGrace, AllowInnerGaps: v.allowInnerGaps, Anchors: slices.Sorted(maps.Keys(v.anchors))}
+	if sc.Anchors == nil {
+		sc.Anchors = []string{}
+	}
+	return sc
 }
 
 func rank(s Severity) int {
