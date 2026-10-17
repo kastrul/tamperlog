@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: tamperlog
+          POSTGRES_PASSWORD: tamperlog
+          POSTGRES_DB: tamperlog
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tamperlog"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Unit tests with race detector
+        run: go test -race -count=1 ./...
+      - name: Integration tests
+        env:
+          TAMPERLOG_PG_DSN: postgres://tamperlog:tamperlog@localhost:5432/tamperlog?sslmode=disable
+        run: go test -race -count=1 -tags integration ./...
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0

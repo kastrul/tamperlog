@@ -1,0 +1,84 @@
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags:
+    - integration
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - depguard
+    - errname
+    - errorlint
+    - exhaustive
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - prealloc
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+  settings:
+    depguard:
+      rules:
+        core:
+          files:
+            - "**/*.go"
+            - "!**/store/pgx/**"
+            - "!**/store/pgsql/**"
+            - "!**/store/sqlite/**"
+            - "!**/seal/sinks/s3lock/**"
+            - "!**/otel/**"
+            - "!**/cmd/**"
+            - "!**/examples/**"
+            - "!**/internal/storetest/**"
+            - "!**/*_test.go"
+          allow:
+            - $gostd
+            - github.com/kastrul/tamperlog
+            - golang.org/x/crypto
+    revive:
+      rules:
+        - name: exported
+          arguments: ["checkPrivateReceivers", "sayRepetitiveInsteadOfStutters"]
+        - name: package-comments
+        - name: unexported-return
+        - name: errorf
+        - name: context-as-argument
+        - name: error-strings
+        - name: receiver-naming
+        - name: var-naming
+        - name: indent-error-flow
+        - name: superfluous-else
+        - name: unused-parameter
+    gosec:
+      excludes:
+        - G115 # integer conversions are checked where they matter
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+    exhaustive:
+      default-signifies-exhaustive: true
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+          - unparam
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/kastrul/tamperlog
