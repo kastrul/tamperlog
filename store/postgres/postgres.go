@@ -279,18 +279,19 @@ func (s *Store) PutSeal(ctx context.Context, st seal.Stored) error {
 func (s *Store) LastSeal(ctx context.Context) (seal.Stored, bool, error) {
 	var st seal.Stored
 	var seq *int64
+	var sealedAt *time.Time
 	err := s.q.QueryRow(ctx, `
 SELECT last.seq, last.sealed_at, last.hash, last.body FROM (SELECT 1) AS one
 LEFT JOIN LATERAL (SELECT seq, sealed_at, hash, body FROM `+s.t+`seal ORDER BY seq DESC LIMIT 1) AS last ON true`).
-		Scan(&seq, &st.SealedAt, &st.Hash, &st.Bytes)
+		Scan(&seq, &sealedAt, &st.Hash, &st.Bytes)
 	if err != nil {
 		return seal.Stored{}, false, fmt.Errorf("postgres: last seal: %w", err)
 	}
-	if seq == nil {
+	if seq == nil || sealedAt == nil {
 		return seal.Stored{}, false, nil
 	}
 	st.Seq = *seq
-	st.SealedAt = st.SealedAt.UTC()
+	st.SealedAt = sealedAt.UTC()
 	return st, true, nil
 }
 
