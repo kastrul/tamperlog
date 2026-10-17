@@ -16,13 +16,23 @@
 // (ADR 0008): a seal key with two versions is a failure, never "take the
 // newest".
 //
+// Retention does not stop anyone with s3:DeleteObject from adding a delete
+// marker on top of a locked version. The marker hides the key from GetObject
+// and from ListObjectsV2 while the version underneath stays intact, so an
+// administrator rolling back the database could hide the later seals from a
+// naive verifier. The sink therefore reads the bucket through
+// ListObjectVersions: List returns every key that has any version or delete
+// marker, and Get fails with [ErrHidden] rather than [seal.ErrNotFound] when
+// a key the store calls missing still has versions.
+//
 // [Sink.Check] and [Sink.Describe] are the operator's preflight: they report
 // whether the bucket has Object Lock, in which mode and with what default
 // retention, whether versioning is on, and, with [WithProbeKey], whether a
-// versioned delete of a freshly written object is in fact refused. Run it
-// against every new bucket and every new provider before citing retention to
-// an auditor; the docs in docs/sinks/s3lock.md cover bucket setup, IAM and
-// the differences between AWS and Hetzner Object Storage.
+// versioned delete of a freshly written object is in fact refused by
+// retention. Run it against every new bucket and every new provider before
+// citing retention to an auditor; the docs in docs/sinks/s3lock.md cover
+// bucket setup, IAM and the differences between AWS and Hetzner Object
+// Storage.
 package s3lock
 
 import (
@@ -54,6 +64,14 @@ import (
 // rather than read either copy.
 var ErrMultipleVersions = errors.New("s3lock: key has multiple versions")
 
+// ErrHidden is returned by [Sink.Get] when the store answers NoSuchKey for a
+// key that still has object versions or delete markers: a delete marker is
+// the current version. On a locked bucket the data underneath cannot have
+// been destroyed, so the key is hidden, not missing, and a verifier must
+// report it as an error, never as an absent seal. It does not wrap
+// [seal.ErrNotFound]. [Sink.Versions] shows the marker and what it covers.
+var ErrHidden = errors.New("s3lock: key is hidden behind a delete marker")
+
 // Retention is the per-object retention [Sink.Put] requests when
 // [WithRetention] is set.
 type Retention struct {
@@ -63,15 +81,16 @@ type Retention struct {
 
 // Sink is a write-once [seal.Sink] on one bucket. Create it with [New].
 type Sink struct {
-	client         *s3.Client
-	bucket         string
-	prefix         string
-	retention      *Retention
-	contentType    string
-	requireLock    bool
-	verifyVersions bool
-	probeKey       string
-	now            func() time.Time
+	client            *s3.Client
+	bucket            string
+	prefix            string
+	retention         *Retention
+	contentType       string
+	requireLock       bool
+	requireCompliance bool
+	verifyVersions    bool
+	probeKey          string
+	now               func() time.Time
 }
 
 // Option configures a [Sink].
@@ -94,8 +113,17 @@ func WithPrefix(prefix string) Option {
 // (COMPLIANCE or GOVERNANCE) until now plus duration. Without it the sink
 // sends no retention headers and relies on the bucket's default retention,
 // which is the recommended setup because the writer credential then needs no
-// retention permissions at all. A per-object retention can lengthen the
-// bucket default but never shorten it.
+// retention permissions at all and cannot weaken anything.
+//
+// An explicit per-object retention replaces the bucket default for that
+// object; it does not add to it. On AWS a Put may therefore set a shorter
+// period or GOVERNANCE mode on a bucket whose default is ten years of
+// COMPLIANCE, unless a bucket policy with the
+// s3:object-lock-remaining-retention-days condition refuses it (see
+// docs/sinks/s3lock.md). [Sink.Check] fails with [ErrWeakRetention] when the
+// configured retention is shorter than the bucket default or GOVERNANCE on a
+// COMPLIANCE bucket. Durations are not validated at option time so that tests
+// can use short ones.
 func WithRetention(mode types.ObjectLockMode, duration time.Duration) Option {
 	return func(s *Sink) { s.retention = &Retention{Mode: mode, Duration: duration} }
 }
@@ -114,21 +142,35 @@ func WithRequireLockedBucket(require bool) Option {
 	return func(s *Sink) { s.requireLock = require }
 }
 
-// WithVerifyVersions controls the version check after Put and before Get
-// (default true). Turning it off saves one ListObjectVersions call per
-// operation and removes the s3:ListBucketVersions permission from the writer,
-// at the price of trusting If-None-Match alone to refuse duplicate keys. Keep
-// it on for any store whose conditional-write support has not been verified
-// with the write probe.
+// WithRequireCompliance makes [Sink.Check] fail with [ErrNotCompliance]
+// unless the retention mode objects will carry is COMPLIANCE: the
+// [WithRetention] mode when set, otherwise the bucket's default retention
+// mode, and the mode the write probe observed when a probe ran. GOVERNANCE
+// retention is removed by any principal holding
+// s3:BypassGovernanceRetention, which account administrators usually do, so
+// only COMPLIANCE meets the administrator threat model. Set it in production
+// together with [WithRequireLockedBucket].
+func WithRequireCompliance(require bool) Option {
+	return func(s *Sink) { s.requireCompliance = require }
+}
+
+// WithVerifyVersions controls the single-version check after Put and before
+// Get (default true). Turning it off saves one ListObjectVersions call per
+// operation, at the price of trusting If-None-Match alone to refuse duplicate
+// keys. Keep it on for any store whose conditional-write support has not been
+// verified with the write probe. It does not remove the need for
+// s3:ListBucketVersions: List and the delete-marker check behind [ErrHidden]
+// always read versions.
 func WithVerifyVersions(verify bool) Option {
 	return func(s *Sink) { s.verifyVersions = verify }
 }
 
 // WithProbeKey makes [Sink.Check] and [Sink.Describe] write a small object
-// under key (relative to the prefix) and attempt a versioned delete of it, to
-// observe whether the store refuses the delete. Each run leaves one more
-// locked version under the probe key for the retention period; pick a key
-// outside the seals/ namespace, such as "probe/check".
+// under key (relative to the prefix), read its retention back and attempt a
+// versioned delete of it, to observe whether retention refuses the delete.
+// Each run leaves one more locked version under the probe key for the
+// retention period; pick a key outside the seals/ namespace, such as
+// "probe/check".
 func WithProbeKey(key string) Option {
 	return func(s *Sink) { s.probeKey = key }
 }
@@ -275,9 +317,12 @@ func (s *Sink) Put(ctx context.Context, key string, data []byte) error {
 	return nil
 }
 
-// Get downloads key. A missing key fails with [seal.ErrNotFound]. With
-// version verification on, a key holding more than one version or a delete
-// marker fails with [ErrMultipleVersions] instead of returning the newest.
+// Get downloads key. When the store answers NoSuchKey, Get lists the key's
+// versions: a key with no version at all fails with [seal.ErrNotFound], a
+// key with versions or delete markers fails with [ErrHidden]. With version
+// verification on, a readable key holding more than one version or a
+// non-current delete marker fails with [ErrMultipleVersions] instead of
+// returning the newest.
 func (s *Sink) Get(ctx context.Context, key string) ([]byte, error) {
 	full, err := s.fullKey(key)
 	if err != nil {
@@ -289,7 +334,7 @@ func (s *Sink) Get(ctx context.Context, key string) ([]byte, error) {
 	})
 	if err != nil {
 		if isNotFound(err) {
-			return nil, fmt.Errorf("%w: %s", seal.ErrNotFound, key)
+			return nil, s.missingOrHidden(ctx, key, full)
 		}
 		return nil, fmt.Errorf("s3lock: get %s: %w", key, err)
 	}
@@ -308,26 +353,57 @@ func (s *Sink) Get(ctx context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
+// missingOrHidden decides between [seal.ErrNotFound] and [ErrHidden] for a
+// key GetObject could not find.
+func (s *Sink) missingOrHidden(ctx context.Context, key, full string) error {
+	vs, err := s.versions(ctx, key, full)
+	if err != nil {
+		return err
+	}
+	if len(vs) == 0 {
+		return fmt.Errorf("%w: %s", seal.ErrNotFound, key)
+	}
+	markers := 0
+	for _, v := range vs {
+		if v.DeleteMarker {
+			markers++
+		}
+	}
+	return fmt.Errorf("%w: %s has %d delete marker(s) over %d version(s)", ErrHidden, key, markers, len(vs)-markers)
+}
+
 // List returns the keys under prefix, relative to the sink's own prefix, in
-// lexical order.
+// lexical order. It pages through ListObjectVersions rather than
+// ListObjectsV2 and returns every key that has any version or delete marker,
+// so a key hidden behind a delete marker is still listed; Get on such a key
+// fails with [ErrHidden].
 func (s *Sink) List(ctx context.Context, prefix string) ([]string, error) {
 	full := s.prefix + strings.TrimLeft(prefix, "/")
-	in := &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket)}
+	in := &s3.ListObjectVersionsInput{Bucket: aws.String(s.bucket)}
 	if full != "" {
 		in.Prefix = aws.String(full)
 	}
+	seen := map[string]bool{}
 	var keys []string
-	p := s3.NewListObjectsV2Paginator(s.client, in)
+	add := func(k *string) {
+		key := aws.ToString(k)
+		if !strings.HasPrefix(key, s.prefix) || seen[key] {
+			return
+		}
+		seen[key] = true
+		keys = append(keys, strings.TrimPrefix(key, s.prefix))
+	}
+	p := s3.NewListObjectVersionsPaginator(s.client, in)
 	for p.HasMorePages() {
 		page, err := p.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("s3lock: list %s: %w", prefix, err)
 		}
-		for _, o := range page.Contents {
-			if o.Key == nil || !strings.HasPrefix(*o.Key, s.prefix) {
-				continue
-			}
-			keys = append(keys, strings.TrimPrefix(*o.Key, s.prefix))
+		for _, v := range page.Versions {
+			add(v.Key)
+		}
+		for _, d := range page.DeleteMarkers {
+			add(d.Key)
 		}
 	}
 	sort.Strings(keys)
@@ -346,7 +422,8 @@ type Version struct {
 
 // Versions returns every version and delete marker under key, the latest
 // first and then newest to oldest. A verifier or the CLI uses it to show why
-// a key failed with [ErrMultipleVersions]; it needs s3:ListBucketVersions.
+// a key failed with [ErrMultipleVersions] or [ErrHidden]; it needs
+// s3:ListBucketVersions.
 func (s *Sink) Versions(ctx context.Context, key string) ([]Version, error) {
 	full, err := s.fullKey(key)
 	if err != nil {

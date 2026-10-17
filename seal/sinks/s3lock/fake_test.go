@@ -39,6 +39,10 @@ type fakeS3 struct {
 	defaultDays       int32
 	ignoreIfNoneMatch bool // behave like a store without conditional writes
 	rejectConditional bool // answer 409 ConditionalRequestConflict instead of 412
+	denyDeletes       bool // refuse every DeleteObject with AccessDenied, as an IAM policy would
+	omitVersionIDs    bool // leave x-amz-version-id out of PutObject replies
+	hideRetention     bool // leave the lock headers out of HeadObject/GetObject replies
+	versionPageSize   int  // max-keys cap for ListObjectVersions, 1000 when 0
 
 	puts []http.Header // headers of every PutObject, for assertions
 }
@@ -260,8 +264,21 @@ func (f *fakeS3) listObjectsV2(w http.ResponseWriter, q map[string][]string) {
 	writeXML(w, res)
 }
 
+// listVersions serves ListObjectVersions the way AWS pages it: entries
+// ordered by key and then newest version first, at most max-keys per page,
+// with NextKeyMarker and NextVersionIdMarker pointing at the last entry
+// returned.
 func (f *fakeS3) listVersions(w http.ResponseWriter, q map[string][]string) {
 	prefix := first(q, "prefix")
+	keyMarker := first(q, "key-marker")
+	vidMarker := first(q, "version-id-marker")
+	maxKeys := 1000
+	if m := first(q, "max-keys"); m != "" {
+		maxKeys, _ = strconv.Atoi(m)
+	}
+	if f.versionPageSize > 0 && maxKeys > f.versionPageSize {
+		maxKeys = f.versionPageSize
+	}
 	type version struct {
 		Key          string `xml:"Key"`
 		VersionID    string `xml:"VersionId"`
@@ -271,31 +288,65 @@ func (f *fakeS3) listVersions(w http.ResponseWriter, q map[string][]string) {
 		Size         int    `xml:"Size"`
 	}
 	type result struct {
-		XMLName       xml.Name  `xml:"ListVersionsResult"`
-		Name          string    `xml:"Name"`
-		Prefix        string    `xml:"Prefix"`
-		IsTruncated   bool      `xml:"IsTruncated"`
-		Versions      []version `xml:"Version"`
-		DeleteMarkers []version `xml:"DeleteMarker"`
+		XMLName             xml.Name  `xml:"ListVersionsResult"`
+		Name                string    `xml:"Name"`
+		Prefix              string    `xml:"Prefix"`
+		KeyMarker           string    `xml:"KeyMarker"`
+		VersionIDMarker     string    `xml:"VersionIdMarker"`
+		MaxKeys             int       `xml:"MaxKeys"`
+		IsTruncated         bool      `xml:"IsTruncated"`
+		NextKeyMarker       string    `xml:"NextKeyMarker,omitempty"`
+		NextVersionIDMarker string    `xml:"NextVersionIdMarker,omitempty"`
+		Versions            []version `xml:"Version"`
+		DeleteMarkers       []version `xml:"DeleteMarker"`
 	}
-	res := result{Name: f.bucket, Prefix: prefix}
+	type entry struct {
+		key    string
+		v      *fakeVersion
+		latest bool
+	}
+	var all []entry
 	for _, k := range f.sortedKeys() {
 		if !strings.HasPrefix(k, prefix) {
 			continue
 		}
 		vs := f.objects[k]
 		for i := len(vs) - 1; i >= 0; i-- { // newest first, like AWS
-			v := vs[i]
-			e := version{
-				Key: k, VersionID: v.id, IsLatest: i == len(vs)-1,
-				LastModified: v.modified.Format("2006-01-02T15:04:05.000Z"), ETag: v.etag, Size: len(v.data),
-			}
-			if v.deleteMarker {
-				res.DeleteMarkers = append(res.DeleteMarkers, e)
-			} else {
-				res.Versions = append(res.Versions, e)
-			}
+			all = append(all, entry{key: k, v: vs[i], latest: i == len(vs)-1})
 		}
+	}
+	start := 0
+	switch {
+	case keyMarker == "":
+	case vidMarker == "":
+		for start < len(all) && all[start].key <= keyMarker {
+			start++
+		}
+	default:
+		for start < len(all) && (all[start].key != keyMarker || all[start].v.id != vidMarker) {
+			start++
+		}
+		if start < len(all) {
+			start++
+		}
+	}
+	end := min(start+maxKeys, len(all))
+	res := result{Name: f.bucket, Prefix: prefix, KeyMarker: keyMarker, VersionIDMarker: vidMarker, MaxKeys: maxKeys}
+	for _, e := range all[start:end] {
+		x := version{
+			Key: e.key, VersionID: e.v.id, IsLatest: e.latest,
+			LastModified: e.v.modified.Format("2006-01-02T15:04:05.000Z"), ETag: e.v.etag, Size: len(e.v.data),
+		}
+		if e.v.deleteMarker {
+			res.DeleteMarkers = append(res.DeleteMarkers, x)
+		} else {
+			res.Versions = append(res.Versions, x)
+		}
+	}
+	if end < len(all) {
+		res.IsTruncated = true
+		res.NextKeyMarker = all[end-1].key
+		res.NextVersionIDMarker = all[end-1].v.id
 	}
 	writeXML(w, res)
 }
@@ -334,7 +385,9 @@ func (f *fakeS3) putObject(w http.ResponseWriter, r *http.Request, key string) {
 	}
 	v := f.put(key, body, r.Header.Get("Content-Type"), r.Header.Get("x-amz-object-lock-mode"), retainUntil)
 	w.Header().Set("ETag", v.etag)
-	w.Header().Set("x-amz-version-id", v.id)
+	if !f.omitVersionIDs {
+		w.Header().Set("x-amz-version-id", v.id)
+	}
 	w.Header().Set("x-amz-checksum-sha256", v.checksum)
 	w.WriteHeader(http.StatusOK)
 }
@@ -368,7 +421,7 @@ func (f *fakeS3) getObject(w http.ResponseWriter, r *http.Request, key, versionI
 	h.Set("Last-Modified", v.modified.Format(http.TimeFormat))
 	h.Set("x-amz-version-id", v.id)
 	h.Set("x-amz-checksum-sha256", v.checksum)
-	if v.lockMode != "" {
+	if v.lockMode != "" && !f.hideRetention {
 		h.Set("x-amz-object-lock-mode", v.lockMode)
 		h.Set("x-amz-object-lock-retain-until-date", v.retainUntil.UTC().Format(time.RFC3339))
 	}
@@ -379,6 +432,10 @@ func (f *fakeS3) getObject(w http.ResponseWriter, r *http.Request, key, versionI
 }
 
 func (f *fakeS3) deleteObject(w http.ResponseWriter, key, versionID string) {
+	if f.denyDeletes {
+		s3Error(w, http.StatusForbidden, "AccessDenied", "User is not authorized to perform: s3:DeleteObjectVersion")
+		return
+	}
 	vs := f.objects[key]
 	if versionID == "" {
 		if f.versioning == "Enabled" {

@@ -69,7 +69,9 @@ func TestIntegration(t *testing.T) {
 			info.Probe.Key, info.Probe.VersionID, info.Probe.Mode, info.Probe.RetainUntil,
 			info.Probe.DeleteDenied, info.Probe.Deleted, info.Probe.DeleteError)
 	}
-	if err := s.Check(ctx); err != nil {
+	checked, err := s.Check(ctx)
+	t.Logf("Check:\n%s", checked)
+	if err != nil {
 		t.Errorf("Check: %v", err)
 	}
 

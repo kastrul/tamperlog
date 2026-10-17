@@ -21,10 +21,16 @@ client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 sink := s3lock.New(client, "acme-audit-seals",
     s3lock.WithPrefix("prod"),
     s3lock.WithRequireLockedBucket(true),
+    s3lock.WithRequireCompliance(true),
     s3lock.WithProbeKey("probe/check"), // only for the operator CLI, not the writer
 )
-if err := sink.Check(ctx); err != nil { ... }
+info, err := sink.Check(ctx)
+fmt.Println(info) // mode, default retention, versioning, probe, verdict
+if err != nil { ... }
 ```
+
+The `tamperlog` CLI runs `Check` at startup of `seal`, `anchor` and `verify`
+and prints `Info`.
 
 ## Bucket requirements
 
@@ -37,14 +43,21 @@ if err := sink.Check(ctx); err != nil { ... }
    because the sink's duplicate-key detection (below) needs versions.
 3. **Default retention in COMPLIANCE mode** for the full statutory period.
    With a bucket default the writer credential needs no retention
-   permissions at all and cannot shorten anything. Per-object retention
-   (`WithRetention`) can only lengthen the default.
+   permissions at all and cannot weaken anything. An explicit per-object
+   retention (`WithRetention`) *replaces* the default for that object, it
+   does not add to it: on AWS a Put may set a shorter period or GOVERNANCE
+   mode on a ten-year COMPLIANCE bucket unless a bucket policy refuses it
+   (the `NoShortRetention` statement below). Prefer the bucket default; if
+   you do set `WithRetention`, `Check` fails with `ErrWeakRetention` when
+   the duration is shorter than the default or the mode is GOVERNANCE on a
+   COMPLIANCE bucket.
 4. **Lifecycle rules do not remove locked versions.** An expiration rule on
    a locked bucket adds delete markers and removes versions only after their
    retain-until date; both AWS and Hetzner document this. A delete marker
-   still hides the key from `GetObject`, which the sink reports as
-   `ErrNotFound` and the verifier as a missing seal, so do not attach
-   expiration rules to the seal prefix at all. If you need to reclaim space
+   hides the key from `GetObject`; the sink reports such a key as
+   `ErrHidden` (an error, not a missing seal), still lists it, and the
+   verifier fails on it, so do not attach expiration rules to the seal
+   prefix at all. If you need to reclaim space
    after retention, use a `NoncurrentVersionExpiration` rule that only
    touches noncurrent versions and understand that a legitimate seal key
    never has a noncurrent version.
@@ -74,12 +87,16 @@ Then run `Check` with a probe key (see "Preflight") before the first seal.
   `PreconditionFailed` or 409 `ConditionalRequestConflict` becomes
   `seal.ErrExists`. After a successful write the sink lists the key's
   versions and fails with `ErrMultipleVersions` if there is more than one.
-- **Get** downloads the key, maps `NoSuchKey` to `seal.ErrNotFound`, and
-  (by default) lists versions and fails with `ErrMultipleVersions` rather
-  than returning any copy when two exist.
-- **List** pages through `ListObjectsV2` under the prefix and returns keys
-  relative to the prefix in lexical order; `seal.Key` uses fixed-width
-  sequence numbers so lexical and numeric order agree.
+- **Get** downloads the key. On `NoSuchKey` it lists the key's versions:
+  no version at all is `seal.ErrNotFound`; any version or delete marker is
+  `ErrHidden`, because the store is hiding data it could not destroy. A
+  readable key is (by default) checked for a single version and fails with
+  `ErrMultipleVersions` rather than returning any copy when two exist.
+- **List** pages through `ListObjectVersions` (not `ListObjectsV2`, which
+  omits keys whose current version is a delete marker) and returns every
+  key that has any version or marker, relative to the prefix, deduplicated,
+  in lexical order; `seal.Key` uses fixed-width sequence numbers so lexical
+  and numeric order agree.
 - **Versions** returns every version and delete marker under a key (version
   id, time, size, ETag) for the verifier and the CLI.
 
@@ -102,6 +119,18 @@ one rule, and the verifier must apply the same one (ADR 0008, ADR 0015):
 > and never picks the newest, the oldest or the one that matches the
 > database.
 
+Delete markers are the other half of the same rule. Retention stops nobody
+with `s3:DeleteObject` from issuing an unversioned delete, which adds a
+marker on top of the locked version: `GetObject` then answers `NoSuchKey`
+and `ListObjectsV2` omits the key, while the version underneath is intact.
+An administrator who rolls the database back to seal 1200 can hide seals
+1201 onwards that way, and a verifier that trusted `ListObjectsV2` would see
+a sink that agrees with the rolled-back database. The sink therefore lists
+through `ListObjectVersions`, so hidden keys still appear in the inventory,
+and `Get` on them returns `ErrHidden` instead of `seal.ErrNotFound`, so the
+verifier reports an error, not a missing copy. `Versions` shows the marker
+and the versions it covers.
+
 The rule is sound because the writer never legitimately writes a key twice:
 seals are append-only with a strictly increasing sequence and proofs use a
 provider-suffixed key. A transport retry whose first attempt reached the
@@ -118,30 +147,54 @@ the verifier's version check regardless.
 
 `Describe(ctx)` returns an `Info` with what the bucket reports:
 `HeadBucket` reachability, `GetObjectLockConfiguration` (enabled, default
-mode, days or years), `GetBucketVersioning`, and, with `WithProbeKey`, a
-`ProbeResult`. `Check(ctx)` runs `Describe` and returns a joined error for
-every problem: unreachable bucket, versioning not Enabled
-(`ErrNotVersioned`), lock required but absent (`ErrNotLocked`), lock
-present but no default retention and none configured on the sink
-(`ErrUnprotected`), probe version deleted (`ErrUnprotected`), or a probe
-delete that failed for a reason other than `AccessDenied`.
+mode, days or years), `GetBucketVersioning`, the `EffectiveMode` objects
+written by this sink will carry (the probe's observed mode, else the
+`WithRetention` mode, else the bucket default) and, with `WithProbeKey`, a
+`ProbeResult`. `Check(ctx) (Info, error)` runs `Describe`, fills
+`Info.Problems` and returns a joined error for every problem: unreachable
+bucket, versioning not Enabled (`ErrNotVersioned`), lock required but absent
+(`ErrNotLocked`), lock present but no default retention and none configured
+on the sink (`ErrUnprotected`), probe version deleted (`ErrUnprotected`),
+`WithRetention` weaker than the bucket default (`ErrWeakRetention`),
+COMPLIANCE required but the effective mode is something else
+(`ErrNotCompliance`), or a probe that ran without demonstrating retention
+(`ErrProbeInconclusive`).
+
+`Info.String()` prints the summary for the operator: lock mode and default
+retention, versioning, per-object retention, effective mode, probe outcome
+and a verdict line. `Info.Adequate()` is that verdict: true only when Check
+found no problems, Object Lock and versioning are on, the effective mode is
+COMPLIANCE and the probe, if it ran, was conclusive. A bucket can pass
+`Check` without being adequate (a GOVERNANCE development bucket, say); the
+verdict says what is missing for the administrator threat model.
 
 The probe writes a small `text/plain` object under the probe key, reads its
-lock state with `HeadObject` (reported when the credential has
-`s3:GetObjectRetention`) and issues `DeleteObject` with the version id. On a
-retained version the store must answer 403 `AccessDenied`; that is the
-observation you cite, not the configuration. Each run leaves one more locked
-version under the probe key until retention expires, so pick a key outside
-`seals/` (`probe/check`) and run it from the operator's credential, not from
-the writer: the writer has no `s3:DeleteObjectVersion` and would report
-`AccessDenied` for the wrong reason.
+lock state back with `HeadObject` and issues `DeleteObject` with the version
+id. It is **conclusive** only when all three hold: `PutObject` returned a
+version id, `HeadObject` on that version reports a lock mode with a
+retain-until date in the future, and the versioned delete was refused with
+403 `AccessDenied`. An `AccessDenied` on its own proves nothing, because an
+IAM or bucket policy denies deletes just as well; a missing version id means
+the store is not versioning (the probe then does not attempt the delete,
+which would only add a marker); a `HeadObject` without lock headers means
+the credential lacks `s3:GetObjectRetention` or the version is not retained.
+`ProbeResult.Conclusive` and `ProbeResult.Reason` record which, and `Check`
+fails with `ErrProbeInconclusive` so that the run is not cited as evidence.
+Each run leaves one more locked version under the probe key until retention
+expires, so pick a key outside `seals/` (`probe/check`) and run it from the
+operator's credential, not from the writer: the writer has no
+`s3:DeleteObjectVersion` and would report `AccessDenied` for the wrong
+reason.
 
 The probe cannot demonstrate COMPLIANCE as opposed to GOVERNANCE, because a
-versioned delete without the bypass header is refused in both modes. Read
-the mode from `ProbeResult.Mode` or `Info.DefaultMode` and, to be certain,
-attempt the delete once with `--bypass-governance-retention` from a
-credential that holds `s3:BypassGovernanceRetention`: a COMPLIANCE version
-still refuses.
+versioned delete without the bypass header is refused in both modes. It
+reports the mode `HeadObject` returned in `ProbeResult.Mode`, which becomes
+`Info.EffectiveMode`; `WithRequireCompliance(true)` makes `Check` fail with
+`ErrNotCompliance` unless that mode (or, without a probe, the configured
+`WithRetention` mode or the bucket default) is COMPLIANCE. To be certain
+beyond the reported mode, attempt the delete once with
+`--bypass-governance-retention` from a credential that holds
+`s3:BypassGovernanceRetention`: a COMPLIANCE version still refuses.
 
 ## Credentials and policy
 
@@ -181,14 +234,19 @@ set or remove retention or legal holds, or change the bucket.
 
 Notes:
 
-- `s3:ListBucketVersions` on the writer is needed only for the default
-  `WithVerifyVersions(true)`. `s3:ListBucket` lets the writer's `List` work
-  and lets the SDK return `NoSuchKey` instead of `AccessDenied` for a
-  missing key.
+- `s3:ListBucketVersions` is needed by writer and verifier alike: `List`
+  reads `ListObjectVersions`, and `Get` lists versions to tell a missing key
+  (`ErrNotFound`) from a hidden one (`ErrHidden`). `WithVerifyVersions(false)`
+  only drops the single-version check after Put and before Get.
+  `s3:ListBucket` lets the SDK return `NoSuchKey` instead of `AccessDenied`
+  for a missing key.
 - The `NoShortRetention` statement is AWS-only (Hetzner does not document
   the condition key) and refuses any Put whose explicit retention is
   shorter than the policy's floor; with no explicit retention the bucket
-  default applies and the condition passes.
+  default applies and the condition passes. It is the only server-side
+  guard against a writer that sets a short or GOVERNANCE per-object
+  retention on a COMPLIANCE bucket; `Check`'s `ErrWeakRetention` catches a
+  misconfigured sink, not a hostile one.
 - The operator credential that runs `Check` with a probe additionally needs
   `s3:GetObjectRetention` (to report the mode) and `s3:DeleteObjectVersion`
   (so that a refusal is a lock refusal, not a policy refusal), plus
@@ -208,9 +266,13 @@ GOVERNANCE therefore protects against operators without the permission, not
 against account administrators or a compromised admin credential. It is
 suitable for staging, for rehearsing retention settings before committing to
 ten years, and for operational artefacts a named break-glass identity should
-be able to remove. The sink accepts either mode in `WithRetention`; `Check`
-reports the mode it finds and does not refuse GOVERNANCE, because that is a
-policy decision for the operator and the DPO.
+be able to remove. The sink accepts either mode in `WithRetention`. `Check`
+reports the effective mode and, by default, does not refuse GOVERNANCE,
+because that is a policy decision for the operator and the DPO; set
+`WithRequireCompliance(true)` in production so that `Check` fails with
+`ErrNotCompliance` on anything else, and read `Info.Adequate()`, which is
+false for GOVERNANCE regardless of the options, before citing the bucket
+as protection against administrators.
 
 COMPLIANCE is a cost and legal commitment: storage cannot be reclaimed
 early even if the data turns out wrong, and a GDPR erasure request cannot
@@ -247,8 +309,10 @@ and no third-party WORM assessment (of the kind Cohasset Associates
 performed for AWS) was found. Before citing Hetzner retention to an auditor:
 
 1. Run `Check` with `WithProbeKey` from the project owner's credential and
-   keep the output: it records that a versioned delete of a freshly written
-   object was refused with `AccessDenied` on that date.
+   keep `Info.String()`: a conclusive probe records that on that date a
+   freshly written version carried the reported retention and its versioned
+   delete was refused. An inconclusive probe is not evidence; fix the
+   reason it reports and run again.
 2. Run the integration test (`go test -tags integration`) once against the
    bucket: it reports whether a duplicate Put was refused by `If-None-Match`
    (`ErrExists`) or detected after the fact (`ErrMultipleVersions`). If the
@@ -288,8 +352,11 @@ date, so set the default retention to the statutory period and no longer.
 - [ ] Writer credential: `s3:PutObject` (+ `s3:ListBucket`,
       `s3:ListBucketVersions`); no delete, no retention, no bypass.
 - [ ] Verifier credential: read and list only.
-- [ ] `Check` with a probe key passed from the operator credential; output
-      archived with the system description.
+- [ ] `Check` with a probe key passed from the operator credential, probe
+      conclusive, verdict "adequate"; `Info.String()` archived with the
+      system description.
+- [ ] Writer and verifier built with `WithRequireLockedBucket(true)` and
+      `WithRequireCompliance(true)`.
 - [ ] Integration test run once per provider; conditional-write support
       recorded.
 - [ ] Second sink in a different administrative domain for the
