@@ -126,6 +126,9 @@ END;
 DROP TRIGGER IF EXISTS tamperlog_event_check_link;
 CREATE TRIGGER tamperlog_event_check_link BEFORE INSERT ON tamperlog_event
 BEGIN
+  SELECT RAISE(ABORT, 'tamperlog: at is not the database clock')
+  WHERE abs(NEW.at - CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER)) > 5000000;
+
   SELECT RAISE(ABORT, 'tamperlog: seq does not follow the stream head')
   WHERE NEW.seq <> coalesce((SELECT max(seq) FROM tamperlog_event WHERE stream = NEW.stream), 0) + 1;
 
@@ -143,9 +146,6 @@ BEGIN
 
   SELECT RAISE(ABORT, 'tamperlog: at precedes the stream head')
   WHERE NEW.at < (SELECT at FROM tamperlog_event WHERE stream = NEW.stream ORDER BY seq DESC LIMIT 1) - 1000000;
-
-  SELECT RAISE(ABORT, 'tamperlog: at is not the database clock')
-  WHERE abs(NEW.at - CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER)) > 5000000;
 END;
 
 -- Seals form their own chain: dense sequence numbers.

@@ -125,7 +125,7 @@ VALUES (?, ?, ?, '', '', 'x', 'y', '', ?, ?, NULL, '{}', ?, ?)`
 	t.Run("CheckConstraints", func(t *testing.T) {
 		mustFail(t, db, "CHECK", insert, "Bad Stream", 1, now, head.Encoder, head.Hasher, zero, head.Hash)
 		mustFail(t, db, "CHECK", insert, "short", 1, now, head.Encoder, head.Hasher, zero[:8], head.Hash[:8])
-		mustFail(t, db, "CHECK", insert, "s", 3, now, "", head.Hasher, head.Hash, head.Hash)
+		mustFail(t, db, "CHECK", insert, "fresh", 1, now, "", head.Hasher, zero, head.Hash)
 	})
 	t.Run("ValidInsertPasses", func(t *testing.T) {
 		if _, err := db.ExecContext(c, insert, "s", 3, now, head.Encoder, head.Hasher, head.Hash, head.Hash); err != nil {

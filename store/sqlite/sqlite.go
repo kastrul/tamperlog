@@ -37,10 +37,11 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // registers the "sqlite" driver
+	sqlite3 "modernc.org/sqlite" // registers the "sqlite" driver
 
 	"github.com/kastrul/tamperlog"
 )
@@ -210,12 +211,12 @@ type store struct {
 // Head validates the stream name, takes the database writer lock by writing
 // the stream's row in tamperlog_stream_head (INSERT OR IGNORE, so the second
 // and later calls change nothing), and returns the last link and the process
-// clock. Waiting for the lock honours ctx.
+// clock. It waits for a running writer until ctx ends.
 func (s *store) Head(ctx context.Context, stream string) (tamperlog.Head, error) {
 	if err := tamperlog.ValidateStream(stream); err != nil {
 		return tamperlog.Head{}, err
 	}
-	if _, err := s.q.ExecContext(ctx, `INSERT OR IGNORE INTO tamperlog_stream_head (stream) VALUES (?)`, stream); err != nil {
+	if err := s.lock(ctx, stream); err != nil {
 		return tamperlog.Head{}, fmt.Errorf("sqlite: lock %s: %w", stream, err)
 	}
 	h := tamperlog.Head{Now: s.opts.clock()}
@@ -230,6 +231,51 @@ func (s *store) Head(ctx context.Context, stream string) (tamperlog.Head, error)
 	}
 	h.At = micros(at)
 	return h, nil
+}
+
+// lockStep is the busy_timeout, in milliseconds, used while waiting for the
+// writer lock: SQLite's busy handler does not notice sqlite3_interrupt, so the
+// wait is cut into steps and ctx is checked between them.
+const lockStep = 100
+
+// lock takes the writer lock for the transaction by writing the stream's row.
+// The connection's busy_timeout is lowered to lockStep for the attempt and
+// restored afterwards, also when ctx has ended.
+func (s *store) lock(ctx context.Context, stream string) error {
+	var saved int
+	if err := s.q.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&saved); err != nil {
+		return err
+	}
+	if _, err := s.q.ExecContext(ctx, `PRAGMA busy_timeout = `+strconv.Itoa(lockStep)); err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = s.q.ExecContext(context.WithoutCancel(ctx), `PRAGMA busy_timeout = `+strconv.Itoa(saved)) //nolint:gosec // integer read from the connection's own pragma
+	}()
+	for {
+		_, err := s.q.ExecContext(ctx, `INSERT OR IGNORE INTO tamperlog_stream_head (stream) VALUES (?)`, stream)
+		if err == nil {
+			return nil
+		}
+		if !isBusy(err) {
+			return err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+}
+
+// isBusy reports whether err is SQLITE_BUSY from a running writer, the case
+// worth waiting for. SQLITE_BUSY_SNAPSHOT (the transaction read before it
+// wrote and the database moved on) cannot succeed by waiting.
+func isBusy(err error) bool {
+	var e *sqlite3.Error
+	if !errors.As(err, &e) {
+		return false
+	}
+	const busy, busySnapshot = 5, 517
+	return e.Code()&0xff == busy && e.Code() != busySnapshot
 }
 
 // Insert writes r. The primary key refuses a duplicate (stream, seq) and the
