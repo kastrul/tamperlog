@@ -7,7 +7,10 @@ separately because they are frozen independently of the Go API (ADR 0013).
 
 ## [Unreleased]
 
-Initial development towards v0.1.0.
+## [0.1.0] - 2026-10-17
+
+First release. The Go API may change before v1.0.0; the wire formats listed
+below are frozen from this tag on.
 
 ### Added
 
@@ -49,3 +52,6 @@ Initial development towards v0.1.0.
   `binary/v1`, `jcs/v1`, `sha256`, `sha3-256`, `sha512-256`,
   `tamperlog.seal/1`, `tamperlog.bundle/1`, sink keys
   `seals/<12 digits>.json` and `seals/<12 digits>.<provider>.proof`.
+
+[Unreleased]: https://github.com/kastrul/tamperlog/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/kastrul/tamperlog/releases/tag/v0.1.0
